@@ -1,0 +1,94 @@
+[project]
+name = "pydai-ledger"
+version = "0.1.0"
+description = "Reproducible, fully recorded batch runs of Pydantic AI agents (casebook in, ledger out)."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "src/pydai_ledger/fonts/*.txt"]
+authors = [
+    { name = "Tim", email = "tkaluza@e.mail.de" }
+]
+keywords = ["pydantic-ai", "vllm", "llm", "evaluation", "benchmark", "reproducibility", "batch"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+requires-python = ">=3.12"
+dependencies = [
+    "httpx2>=2.16.0",
+    "pydantic-ai-slim[openai]>=2.5",
+]
+
+[project.urls]
+Repository = "https://github.com/TKaluza/pydai-ledger"
+Issues = "https://github.com/TKaluza/pydai-ledger/issues"
+
+[project.optional-dependencies]
+analysis = ["polars>=1.0"]
+report = [
+    "pillow>=10",
+    "segno>=1.6.6",
+]
+sign = ["cryptography>=42"]
+card = ["cryptography>=42", "python-pkcs11>=0.8"]
+pdf = [
+    "segno>=1.6.6",
+    "typst>=0.13",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+# with PYTHONWARNDEFAULTENCODING=1 (set in CI) a text file opened without encoding fails;
+# Windows would read it as cp1252
+filterwarnings = ["error::EncodingWarning"]
+
+[build-system]
+requires = ["uv_build>=0.13.8,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "cryptography>=42",
+    "pillow>=10",
+    "segno>=1.6.6",
+    "typst>=0.13",
+    "python-pkcs11>=0.10.1",
+    "ruff>=0.17.5",
+    "ty>=0.0.103",
+    "polars>=2.1.0",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF", "ANN", "D"]
+ignore = [
+    "ANN401",  # Any is the honest type for JSON-like records and third-party objects
+    "D105", "D107",  # magic methods and __init__ need no docstring
+    "D203", "D213",  # conflict with D211/D212
+    "D205", "D415", "D400",  # a one-sentence summary may wrap; no forced punctuation style
+    "RUF001", "RUF002", "RUF003",  # typographic characters are intended
+    "E501",  # the formatter owns line length; long HTML/Typst strings stay readable
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ANN", "D", "B011"]
+"examples/*" = ["ANN", "D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ty.src]
+include = ["src", "examples"]

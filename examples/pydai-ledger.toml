@@ -1,0 +1,40 @@
+# Sample pydai-ledger.toml.
+# Put the file next to the script (working directory) or pass it explicitly:
+#   execute(plan, journal, config="pydai-ledger.toml")
+#   write_report(ledger, "report.html", config="pydai-ledger.toml")
+# It never changes what the ledger records. It only sets how notes appear in reports
+# and which determinism points must hold before a run starts.
+
+[report.notes]
+# Level per note: "error" (red), "warning" (yellow), "info" (grey) or "off" (hidden).
+# The report lists hidden notes in one line, so nothing disappears silently.
+#
+# Built-in defaults:
+#   stopped, incomplete, failed_attempts, invalid_signature   -> error
+#   no_seed, no_temperature, temperature_nonzero,
+#   provider_only, prefix_cache_reset_failed                   -> warning
+#   prefix_cache_not_reset                                      -> info
+prefix_cache_not_reset = "info"
+no_seed = "error"
+
+[report.remarks]
+# Your own remark on a note; shown under "Background" in HTML, after the text in PDF.
+provider_only = "The gateway hides /server_info on purpose."
+
+[determinism]
+# Points that must hold for bit-identical outputs. Possible points:
+#   temperature_zero      temperature 0 in the agent's model_settings
+#   request_seed          seed in the agent's model_settings
+#   server_seed           seed set on the server (vllm serve --seed)
+#   batch_invariant       VLLM_BATCH_INVARIANT=1 on the server; costs throughput
+#   prefix_cache_neutral  prefix cache off, or reset_prefix_cache=True
+#   single_gpu            tensor_parallel_size 1
+#   multiprocessing_off   VLLM_ENABLE_V1_MULTIPROCESSING=0 (matters mainly for offline runs)
+#   same_server_version   all targets on the same vLLM version
+# The server points need /server_info, i.e. vLLM with VLLM_SERVER_DEV_MODE=1.
+# Without dev mode they are "unknown" and count as not met.
+require = ["temperature_zero", "request_seed", "single_gpu"]
+
+# "error":   execute() stops with DeterminismError before the first attempt.
+# "warning": the run starts; the report shows the missing point as a note.
+on_missing = "error"
