@@ -14,10 +14,16 @@ Developed and tested on Linux; Windows is covered by the test suite in CI only.
 
 ## Installation
 
-Python 3.12 or newer. Until there is a release on PyPI, install from the repository:
+Python 3.12 or newer. Install from [PyPI](https://pypi.org/project/pydai-ledger/):
 
 ```bash
-pip install "pydai-ledger[report,pdf,sign] @ git+https://github.com/TKaluza/pydai-ledger"
+pip install "pydai-ledger[report,pdf,sign]"
+```
+
+or with uv:
+
+```bash
+uv add "pydai-ledger[report,pdf,sign]"
 ```
 
 The core records runs and needs nothing else. Extras add the optional parts:
