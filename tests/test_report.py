@@ -11,10 +11,12 @@ from pydai_ledger import (
     Case,
     Casebook,
     Journal,
+    ReportHeader,
     RunPlan,
     Target,
     Turn,
     execute,
+    write_pdf,
     write_report,
 )
 
@@ -51,8 +53,8 @@ def test_report(tmp_path):
     plan = RunPlan(
         book,
         Agent(),
-        [Target("plain", FunctionModel(answer)), Target("loud", FunctionModel(shout))],
-        concurrency=[1, 2],
+        [Target("plain", FunctionModel(answer, model_name="m")), Target("loud", FunctionModel(shout, model_name="m"))],
+        repeats=2,
     )
     with Journal.open(plan, parent=tmp_path / "staging") as journal:
         run(execute(plan, journal, progress=False))
@@ -66,7 +68,9 @@ def test_report(tmp_path):
         packed = html.split('<script id="cases-data" type="application/octet-stream">')[1].split("</script>")[0]
         return json.loads(gzip.decompress(base64.b64decode(packed)))
 
-    html = write_report(ledger, tmp_path / "report.html", casebook=book, title="T").read_text(encoding="utf-8")
+    header = ReportHeader("T", authors=["Ada", "Bob"], number="R-1", organisation="Lab")
+    html = write_report(ledger, tmp_path / "report.html", casebook=book, header=header).read_text(encoding="utf-8")
+    assert "Authors: Ada, Bob" in html and "R-1" in html and "Lab" in html
     assert "<script>" not in html.split("<main>")[1].split("</main>")[0]  # case content is never markup
     assert "no_seed" in html and "✖ incomplete" in html
     assert "http://" not in html and "https://" not in html  # self-contained
@@ -95,7 +99,7 @@ def test_report(tmp_path):
 def test_reports_in_german_and_pdf(tmp_path):
     pytest.importorskip("typst")
     book = Casebook.write(tmp_path / "c.zip", make_cases())
-    plan = RunPlan(book, Agent(), [Target("t", TestModel())], attempts_per_case=2)
+    plan = RunPlan(book, Agent(), [Target("t", TestModel())], repeats=2)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         with Journal.open(plan, parent=tmp_path) as journal:
@@ -105,8 +109,11 @@ def test_reports_in_german_and_pdf(tmp_path):
 
     german = write_report(ledger, tmp_path / "de.html", casebook=book, lang="de").read_text(encoding="utf-8")
     english = write_report(ledger, tmp_path / "en.html", casebook=book, embed_fonts=False).read_text(encoding="utf-8")
-    assert 'lang="de"' in german and "Übereinstimmung" in german and "Laufbericht" in german
-    assert "Agreement" in english and "@font-face" not in english and "@font-face" in german
+    assert 'lang="de"' in german and "Präzision" in german and "Laufbericht" in german
+    assert "Validierung" in german and "Wiederholbarkeit" in german and "Dreierregel" not in german
+    assert "Richtigkeit" in german and "Genauigkeit" in german and "Ausführung" in german
+    assert 'class="theme"' in german and "prefers-color-scheme" not in german  # light unless switched
+    assert "Trueness" in english and "@font-face" not in english and "@font-face" in german
     assert "<svg" in german.split("</header>")[0]  # the ledger stamp as QR code
     with pytest.raises(ValueError):
         write_report(ledger, tmp_path / "x.html", lang="fr")
@@ -114,8 +121,82 @@ def test_reports_in_german_and_pdf(tmp_path):
     from pydai_ledger import write_pdf
 
     for lang in ("en", "de"):
-        pdf = write_pdf(ledger, tmp_path / f"{lang}.pdf", casebook=book, lang=lang)
+        pdf = write_pdf(ledger, tmp_path / f"{lang}.pdf", casebook=book, lang=lang, header=ReportHeader(authors="Ada"))
         assert pdf.read_bytes().startswith(b"%PDF") and pdf.stat().st_size > 20_000
+    assert "Throughput" not in english and "Attempts per case" in english  # throughput is the benchmark's
+    only = write_report(ledger, tmp_path / "targets.html", sections=["targets"]).read_text(encoding="utf-8")
+    assert "<h2>Models</h2>" in only and "<h2>Validation</h2>" not in only and "<h2>Cases</h2>" not in only
+    with pytest.raises(ValueError, match="Unknown sections"):
+        write_report(ledger, tmp_path / "x.html", sections=["hardware"])
+
+
+def test_benchmark_report(tmp_path):
+    pytest.importorskip("typst")
+    from pydai_ledger import benchmark, write_pdf
+
+    book = Casebook.write(tmp_path / "c.zip", [Case(turns=[f"q{i}"]) for i in range(40)])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        tune = run(
+            benchmark(book, Agent(), Target("t", TestModel()), tmp_path / "tune.zip", parent=tmp_path, progress=False)
+        )
+    html = write_report(tune.ledger, tmp_path / "bench.html").read_text(encoding="utf-8")
+    assert "Benchmark report" in html and "Throughput and latency" in html and "Recommended concurrency" in html
+    assert "<h2>Validation</h2>" not in html and "Results per case" not in html
+    pdf = write_pdf(tune.ledger, tmp_path / "bench.pdf", lang="de")
+    assert pdf.read_bytes().startswith(b"%PDF")
+
+    assert "Result. Warm-up" in html and "<h2>Overview</h2>" not in html
+
+
+def test_model_comparison_is_not_imprecision(tmp_path):
+    def model(text: str, name: str) -> FunctionModel:
+        return FunctionModel(lambda messages, info: ModelResponse(parts=[TextPart(text)]), model_name=name)
+
+    book = Casebook.write(tmp_path / "c.zip", [Case(turns=["colour?"], expected=["blue"])])
+    targets = [Target("a", model("blue", "m1")), Target("b", model("blue", "m1")), Target("c", model("navy", "m2"))]
+    plan = RunPlan(book, Agent(), targets)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with Journal.open(plan, parent=tmp_path) as journal:
+            run(execute(plan, journal, progress=False))
+            ledger = journal.seal(tmp_path / "l.zip")
+    assert ledger.agreement().agreeing == 0  # raw: three targets, two answers
+    from pydai_ledger.summary import build
+
+    summary = build(ledger, book)
+    assert summary["facts"][2] == ["Precision", "100.0 %", "1 turns compared"]  # a and b share a model
+    reproducibility = next(
+        b["table"] for b in summary["validation"] if (b.get("cap") or "").startswith("Reproducibility")
+    )
+    assert reproducibility["rows"] == [["a", "b", "m1", "1", "100.0 %"]]  # only the pair with one model
+    assert not [b for b in summary["validation"] if b["kind"] == "matrix"]  # a matrix needs three targets
+    assert [row[5] for row in summary["model_pairs"]["rows"]] == ["0.0 %", "0.0 %"]
+    assert summary["cases"]["cases"][0]["f"] == 4  # not as expected, but not "differing"
+    html = write_report(ledger, tmp_path / "r.html", casebook=book).read_text(encoding="utf-8")
+    assert "<h2>Model comparison</h2>" in html and "Reproducibility" in html
+
+
+def test_reproducibility_matrix_from_three_targets(tmp_path):
+    def model(text: str) -> FunctionModel:
+        return FunctionModel(lambda messages, info: ModelResponse(parts=[TextPart(text)]), model_name="m")
+
+    book = Casebook.write(tmp_path / "c.zip", [Case(turns=["colour?"], expected=["blue"])])
+    targets = [Target("a", model("blue")), Target("b", model("blue")), Target("c", model("navy"))]
+    plan = RunPlan(book, Agent(), targets)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with Journal.open(plan, parent=tmp_path) as journal:
+            run(execute(plan, journal, progress=False))
+            ledger = journal.seal(tmp_path / "l.zip")
+    from pydai_ledger.summary import build
+
+    matrix = next(b for b in build(ledger, book)["validation"] if b["kind"] == "matrix")
+    assert matrix["targets"] == ["a", "b", "c"]
+    assert matrix["rows"] == [["", "100.0 %", "0.0 %"], ["100.0 %", "", "0.0 %"], ["0.0 %", "0.0 %", ""]]
+    assert matrix["values"][0] == [None, 1.0, 0.0]  # no diagonal: a target is not compared with itself here
+    assert 'class="mx"' in write_report(ledger, tmp_path / "r.html", casebook=book).read_text(encoding="utf-8")
+    assert write_pdf(ledger, tmp_path / "r.pdf", casebook=book).read_bytes().startswith(b"%PDF")
 
 
 def test_normalised_comparison(tmp_path):

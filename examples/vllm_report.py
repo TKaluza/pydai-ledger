@@ -1,11 +1,12 @@
 """Run a small image benchmark against a live vLLM server and write signed reports.
 
-    uv run python examples/vllm_report.py vllm-local http://127.0.0.1:8000/v1 gemma4-26b-qat R-0002 1,4,8
+    uv run python examples/vllm_report.py vllm-local http://127.0.0.1:8000/v1 gemma4-26b-qat R-0002
 
 Each case shows a plain coloured square and asks for its base colour, then for the
-German word. The run sweeps three concurrency levels, is signed with a fresh key and
-ends in an HTML and a PDF report per language. A sixth argument limits the run to the
-first N cases, which helps on slow servers.
+German word. First the server is benchmarked; then the run uses the recommended
+concurrency, repeats every case once to check repeatability, is signed with a fresh key and ends in an HTML and a
+PDF report per language. The benchmark has its own report. A fifth argument limits the
+run to the first N cases, which helps on slow servers.
 """
 
 from __future__ import annotations
@@ -27,9 +28,11 @@ from pydai_ledger import (
     Casebook,
     Journal,
     Ledger,
+    ReportHeader,
     RunPlan,
     Target,
     Turn,
+    benchmark,
     casefold,
     execute,
     generate_key,
@@ -86,11 +89,10 @@ def main(
     url: str,
     model: str,
     number: str,
-    levels: list[int],
     limit: int | None = None,
     out: Path = Path("reports"),
 ) -> None:
-    """Run the benchmark on one server (or reuse its stored ledger) and write the reports into ``out``."""
+    """Benchmark and run on one server (or reuse the stored ledgers) and write the reports into ``out``."""
     runs = Path("runs")  # casebook, key and ledgers stay here, so reports can be rebuilt without the server
     runs.mkdir(exist_ok=True)
     out.mkdir(parents=True, exist_ok=True)
@@ -100,6 +102,7 @@ def main(
     book_path = runs / "colours.casebook.zip"
     book = Casebook.open(book_path) if book_path.exists() else Casebook.write(book_path, cases(120), signing_key=key)
     ledger_path = runs / f"{name}.ledger.zip"
+    bench_path = runs / f"{name}.benchmark.zip"  # the benchmark ledger holds the recommendation
     if ledger_path.exists():
         ledger = Ledger.open(ledger_path)
     else:
@@ -109,29 +112,32 @@ def main(
             model_settings={"temperature": 0, "seed": 7, "max_tokens": 64},
             output_type=NativeOutput(Colour),  # guided JSON; tool output drifts to plain text in later turns
         )
-        plan = RunPlan(book, agent, [target], concurrency=levels, limit=limit)
+        if not bench_path.exists():
+            with asyncio.run(
+                benchmark(book, agent, target, bench_path, parent=runs / "journal", signing_key=key)
+            ) as tune:
+                for lang in ("en", "de"):
+                    header = ReportHeader(authors=["pydai-ledger"], number=number)
+                    write_report(tune.ledger, out / f"{name}-benchmark.{lang}.html", lang=lang, header=header)
+                    write_pdf(tune.ledger, out / f"{name}-benchmark.{lang}.pdf", lang=lang, header=header)
+        with Ledger.open(bench_path) as measured:
+            tuning = measured.tuning()
+        plan = RunPlan(book, agent, [target], repeats=2, concurrency=tuning, limit=limit)
         with Journal.open(plan, parent=runs / "journal") as journal:
             asyncio.run(execute(plan, journal))  # interrupted? run again, it resumes
             ledger = journal.seal(ledger_path, require_complete=False, signing_key=key, cleanup=True)
     print(ledger)
-    for row in ledger.throughput():
-        print(row)
     titles = {"en": f"Colour naming on {name}", "de": f"Farbbenennung auf {name}"}
     for lang, title in titles.items():
-        write_report(
-            ledger, out / f"{name}.{lang}.html", casebook=book, lang=lang, title=title, author="pydai-ledger",
-            number=number, normalize=casefold,
-        )  # fmt: skip
-        write_pdf(
-            ledger, out / f"{name}.{lang}.pdf", casebook=book, lang=lang, style="banded", title=title,
-            author="pydai-ledger", number=number, normalize=casefold,
-        )  # fmt: skip
+        header = ReportHeader(title, authors=["pydai-ledger"], number=number)
+        write_report(ledger, out / f"{name}.{lang}.html", casebook=book, lang=lang, header=header, normalize=casefold)
+        write_pdf(ledger, out / f"{name}.{lang}.pdf", casebook=book, lang=lang, header=header, normalize=casefold)
     ledger.close()
     book.close()
     print(f"reports written to {out}")
 
 
 if __name__ == "__main__":
-    defaults = ["vllm-local", "http://127.0.0.1:8000/v1", "gemma4-26b-qat", "R-0002", "1,4,8", "0"]
+    defaults = ["vllm-local", "http://127.0.0.1:8000/v1", "gemma4-26b-qat", "R-0002", "0"]
     args = [*sys.argv[1:], *defaults[len(sys.argv) - 1 :]]
-    main(args[0], args[1], args[2], args[3], [int(level) for level in args[4].split(",")], int(args[5]) or None)
+    main(args[0], args[1], args[2], args[3], int(args[4]) or None)

@@ -68,8 +68,8 @@ async def run(casebook: Casebook, destination: Path):
         casebook=casebook,
         agent=bond007,
         targets=targets,
-        attempts_per_case=2,
-        concurrency=[1, 4],  # two levels = a small throughput sweep
+        seeds=[7, 8],  # two attempts per case, each with its own seed: does the same come out?
+        concurrency=4,  # per target; targets run side by side
     )
     with Journal.open(plan, parent="tmp") as journal:
         await execute(plan, journal)  # interrupted? run again, it resumes
@@ -85,8 +85,6 @@ async def main() -> None:
 
     agreement = ledger.agreement()
     print(f"agreement: {agreement.agreeing}/{agreement.compared} turns ({agreement.rate:.0%})")
-    for row in ledger.throughput():
-        print(row)
 
 
 if __name__ == "__main__":

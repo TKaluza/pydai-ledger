@@ -16,7 +16,7 @@ import os
 import statistics
 import zipfile
 from collections import defaultdict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -24,9 +24,10 @@ from typing import Any
 
 from . import signing
 from ._util import canonical_json, load_jsonl_xz, sha256_hex
+from .tuning import Tuning
 
 FORMAT = "pydai-ledger/ledger"
-VERSION = 1
+VERSION = 2  # 2: one concurrency per target, seeds per attempt, benchmark ledgers
 
 
 def casefold(output: Any) -> Any:
@@ -72,6 +73,12 @@ class Ledger:
         if manifest.get("format") != FORMAT:
             zf.close()
             raise ValueError(f"{path} is not a ledger (format={manifest.get('format')!r}).")
+        if manifest.get("version") != VERSION:
+            zf.close()
+            raise ValueError(
+                f"{path} has ledger format version {manifest.get('version')!r}; this pydai-ledger reads "
+                f"version {VERSION}. Ledgers written by pydai-ledger 0.1.x are read with pydai-ledger 0.1.1."
+            )
         return cls(path, zf, manifest, prefix)
 
     # -- raw access ---------------------------------------------------------------
@@ -111,11 +118,51 @@ class Ledger:
         """
         return signing.stamp(self._zf, self._prefix, self.manifest["run_id"])
 
-    def autotune(self) -> dict[str, dict[str, Any]]:
-        """Result of an autotune run per target: ``best`` concurrency, the measured
+    def tunings(self) -> dict[str, dict[str, Any]]:
+        """Result of a benchmark per target: ``best`` concurrency, the measured
         ``levels`` with their rate, the ``metric`` and the ``skipped`` levels.
         """
-        return {event["target"]: event for event in self.events("autotune")}
+        found: dict[str, dict[str, Any]] = {}
+        for event in self.events("tuning"):  # the latest one of a target; a resumed benchmark writes several
+            if event["at"] >= found.get(event["target"], {"at": ""})["at"]:
+                found[event["target"]] = event
+        return found
+
+    @property
+    def kind(self) -> str:
+        """``"run"`` for a run, ``"benchmark"`` for the measurements of a benchmark."""
+        return self.manifest["plan"].get("kind", "run")
+
+    def tuning(self, target: str | None = None) -> Tuning:
+        """The recommendation of a benchmark ledger, for ``target`` or its only target."""
+        found = self.tunings()
+        if target is None and len(found) == 1:
+            target = next(iter(found))
+        if target not in found:
+            raise ValueError(f"{self.path} holds no benchmark result for target {target!r}.")
+        event, plan = found[target], self.manifest["plan"]
+        described = next(t for t in plan["targets"] if t["name"] == target)
+        best = next(level for level in event["levels"] if level["concurrency"] == event["best"])
+        return Tuning(
+            concurrency=event["best"],
+            metric=event["metric"],
+            rate=best["rate"],
+            attempts_per_min=next(
+                (
+                    row["attempts_per_s"] * 60
+                    for row in self.throughput()
+                    if row["target"] == target and row["concurrency"] == event["best"] and row["attempts_per_s"]
+                ),
+                None,
+            ),
+            levels=event["levels"],
+            target=target,
+            model_name=described.get("model_name"),
+            system=described.get("system"),
+            casebook_id=plan["casebook_id"],
+            run_id=self.manifest["run_id"],
+            measured_at=event["at"],
+        )
 
     def verify(self, public_key: str | None = None) -> bool:
         """Check shards and blobs against their SHA-256 and the signature, if any.
@@ -145,6 +192,8 @@ class Ledger:
                     "case_index": attempt["case_index"],
                     "case_id": attempt["case_id"],
                     "rep": attempt["rep"],
+                    "seed": attempt.get("seed"),
+                    "repeat": attempt.get("repeat", 0),
                     "status": attempt["status"],
                     "turn": turn["index"],
                     "started_at": turn["started_at"],
@@ -159,24 +208,31 @@ class Ledger:
                     "output": canonical_json(turn["output"]),
                 }
 
-    def agreement(self, normalize: Callable[[Any], Any] | None = None) -> Agreement:
+    def agreement(
+        self, normalize: Callable[[Any], Any] | None = None, *, groups: Mapping[str, Any] | None = None
+    ) -> Agreement:
         """Compare outputs per (case, turn) over all successful attempts.
+
+        ``groups`` maps target names to a label, for example the model name. Outputs are
+        then compared only within a group, so two different models that answer
+        differently do not count as a disagreement.
 
         Outputs agree when their canonical JSON is identical. ``normalize`` is applied
         to every output first, for example :func:`casefold` to ignore case, or your own
         function that rounds numbers or drops fields. Identical bytes are not guaranteed
         by an LLM server even with a fixed seed, so read this as a rate.
         """
-        variants: dict[tuple[int, int], dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
+        variants: dict[tuple[Any, ...], dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
         for row in self.rows():
             if row["status"] == "ok":
                 output = row["output"]
                 if normalize is not None:
                     output = canonical_json(normalize(json.loads(output)))
-                variants[(row["case_index"], row["turn"])][output].append(row["attempt_id"])
+                group = "" if groups is None else str(groups.get(row["target"], row["target"]))
+                variants[(row["case_index"], row["turn"], group)][output].append(row["attempt_id"])
         compared = agreeing = 0
         disagreements = []
-        for (case_index, turn), outputs in sorted(variants.items()):
+        for (case_index, turn, _group), outputs in sorted(variants.items()):
             if sum(len(ids) for ids in outputs.values()) < 2:
                 continue  # nothing to compare against
             compared += 1
@@ -187,13 +243,25 @@ class Ledger:
         return Agreement(compared=compared, agreeing=agreeing, disagreements=disagreements)
 
     def throughput(self) -> list[dict[str, Any]]:
-        """Throughput and latency per (target, concurrency) stage.
+        """Throughput and latency per (target, concurrency) stage. A run has one stage
+        per target; the stages of a benchmark ledger are the levels the benchmark measured.
 
         Wall time is the union of the recorded stage intervals, so both a resumed run
         (several intervals) and parallel workers (overlapping intervals) count correctly.
         """
         intervals: dict[tuple[str, int], list[tuple[float, float]]] = defaultdict(list)
-        for stage in self.events("stage"):
+        stages = self.events("stage")
+        # Only stages on the server a target ended on count, and of those the ones with a
+        # successful attempt: a stage that was measured again must not add its time twice.
+        final: dict[str, tuple[str, Any]] = {}
+        for stage in stages:
+            if stage["ended_at"] >= final.get(stage["target"], ("", None))[0]:
+                final[stage["target"]] = (stage["ended_at"], stage.get("server"))
+        current = [stage for stage in stages if stage.get("server") == final[stage["target"]][1]]
+        worked = {(stage["target"], stage["concurrency"]) for stage in current if stage.get("attempts_ok")}
+        for stage in current:
+            if (stage["target"], stage["concurrency"]) in worked and not stage.get("attempts_ok"):
+                continue
             intervals[(stage["target"], stage["concurrency"])].append(
                 (
                     datetime.fromisoformat(stage["started_at"]).timestamp(),

@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import struct
 import time
+import tomllib
 import warnings
 import zlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import httpx2
@@ -18,16 +21,21 @@ from pydantic_ai import Agent, BinaryContent, NativeOutput, ToolOutput
 from pydantic_ai.models import Model, infer_model
 from pydantic_core import to_jsonable_python
 
+from ._util import canonical_json, sha256_hex
+
 
 @dataclass(frozen=True)
 class Target:
     """A named model endpoint. ``info`` is free-form operator knowledge (GPU, host, notes)
-    that is stored verbatim with every run.
+    that is stored verbatim with every run. ``concurrency`` is how many attempts a
+    :class:`~pydai_ledger.RunPlan` keeps in flight on this target unless the plan says
+    otherwise, for example the number a benchmark recommended.
     """
 
     name: str
     model: Model | str
     info: Mapping[str, Any] = field(default_factory=dict)
+    concurrency: int | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.model, str):
@@ -77,6 +85,40 @@ class Target:
             return response.json() if response is not None else None
         except ValueError:
             return None
+
+
+def load_targets(path: str | os.PathLike[str] = "targets.toml") -> list[Target]:
+    """Read targets from a TOML file, so servers are named in one place and not in code::
+
+        [targets.gpu-a]
+        model = "Qwen/Qwen3-32B"                  # the served model name
+        base_url = "http://gpu-a:8000/v1"         # an OpenAI-compatible endpoint
+        api_key_env = "VLLM_API_KEY"              # optional: name of the variable holding the key
+        concurrency = 32                          # optional, e.g. what a benchmark recommended
+        info = { gpu = "2x RTX 4090" }            # optional, stored verbatim with every run
+
+    The file holds no secret, only the name of the environment variable. Without
+    ``base_url``, ``model`` is a Pydantic AI model string such as ``"openai:gpt-5"``.
+    Models that cannot be described this way are built in code as before.
+    """
+    file = Path(path)
+    data = tomllib.loads(file.read_text(encoding="utf-8")).get("targets") or {}
+    if not data:
+        raise ValueError(f"{file} defines no [targets.<name>] table.")
+    targets = []
+    for name, entry in data.items():
+        unknown = set(entry) - {"model", "base_url", "api_key_env", "concurrency", "info"}
+        if unknown or "model" not in entry:
+            raise ValueError(f"{file}: target {name!r} needs 'model'; unknown keys: {sorted(unknown) or 'none'}.")
+        model: Model | str = entry["model"]
+        if "base_url" in entry:
+            from pydantic_ai.models.openai import OpenAIChatModel
+            from pydantic_ai.providers.openai import OpenAIProvider
+
+            key = os.environ.get(entry.get("api_key_env", ""), "EMPTY")
+            model = OpenAIChatModel(entry["model"], provider=OpenAIProvider(base_url=entry["base_url"], api_key=key))
+        targets.append(Target(name, model, entry.get("info") or {}, entry.get("concurrency")))
+    return targets
 
 
 REDACTED = "[redacted]"
@@ -141,6 +183,14 @@ def identity(snapshot: dict[str, Any]) -> dict[str, Any] | None:
         "version": (snapshot.get("version") or {}).get("version"),
         "models": sorted([str(m.get("id")), str(m.get("root")), str(m.get("max_model_len"))] for m in models),
     }
+
+
+def server_key(snapshot: dict[str, Any]) -> str | None:
+    """A short key for :func:`identity`, recorded with every attempt and stage; None when
+    the server does not say what it is.
+    """
+    found = identity(snapshot)
+    return None if found is None else sha256_hex(canonical_json(found).encode())[:16]
 
 
 async def current_identity(target: Target) -> dict[str, Any] | None:

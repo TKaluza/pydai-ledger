@@ -13,8 +13,10 @@ import json
 import os
 import shutil
 import zipfile
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from ._util import now_iso
 from .casebook import Casebook
@@ -61,11 +63,39 @@ def pack(casebook: Casebook, ledgers: Iterable[Ledger], destination: str | os.Pa
     return destination
 
 
-def open_bundle(path: str | os.PathLike[str]) -> tuple[Casebook, list[Ledger]]:
-    """Open the casebook and all ledgers inside a bundle."""
+@dataclass(frozen=True)
+class Bundle:
+    """The opened parts of a bundle. Use it with ``with``, or unpack it::
+
+    with open_bundle("demo.bundle.zip") as bundle:
+        bundle.casebook, bundle.ledgers
+    book, ledgers = open_bundle("demo.bundle.zip")
+    """
+
+    casebook: Casebook
+    ledgers: list[Ledger]
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter((self.casebook, self.ledgers))
+
+    def close(self) -> None:
+        """Close the casebook and all ledgers."""
+        self.casebook.close()
+        for ledger in self.ledgers:
+            ledger.close()
+
+    def __enter__(self) -> Bundle:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
+def open_bundle(path: str | os.PathLike[str]) -> Bundle:
+    """Open the casebook and all ledgers (runs and benchmarks) inside a bundle."""
     with zipfile.ZipFile(path, "r") as zf:
         manifest = json.loads(zf.read("manifest.json"))
     if manifest.get("format") != FORMAT:
         raise ValueError(f"{path} is not a bundle (format={manifest.get('format')!r}).")
     casebook = Casebook.open(path, prefix="casebook/")
-    return casebook, [Ledger.open(path, prefix=f"runs/{run_id}/") for run_id in manifest["runs"]]
+    return Bundle(casebook, [Ledger.open(path, prefix=f"runs/{run_id}/") for run_id in manifest["runs"]])

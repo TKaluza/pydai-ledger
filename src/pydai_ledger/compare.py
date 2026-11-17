@@ -37,6 +37,13 @@ class Comparison(Ledger):
                 "schema); the report shows the agent of the first one.",
                 stacklevel=2,
             )
+        cases = sorted(
+            {
+                index
+                for plan in plans
+                for index in (plan["cases"] if plan.get("cases") is not None else range(plan["case_count"]))
+            }
+        )
         self.ledgers = list(ledgers)
         self.path = Path("+".join(ledger.path.name for ledger in ledgers))
         first = ledgers[0].manifest
@@ -46,9 +53,19 @@ class Comparison(Ledger):
             "plan": {
                 **plans[0],
                 "targets": [target for plan in plans for target in plan["targets"]],
-                "concurrency": sorted({level for plan in plans for level in plan["concurrency"]}),
-                "case_count": max(plan["case_count"] for plan in plans),
+                "concurrency": {
+                    target["name"]: plan["concurrency"][target["name"]]
+                    if isinstance(plan["concurrency"], dict)
+                    else plan["concurrency"]  # ledgers before version 2 list their levels
+                    for plan in plans
+                    for target in plan["targets"]
+                },
+                "case_count": len(cases),
                 "attempts_per_case": max(plan["attempts_per_case"] for plan in plans),
+                "repeats": max(plan["repeats"] for plan in plans),  # shown only; attempts carry their own
+                "seeds": list(dict.fromkeys(seed for plan in plans for seed in plan.get("seeds") or [])),
+                # every case any of the runs covers; None when all of them ran the first cases
+                "cases": None if all(plan.get("cases") is None for plan in plans) else cases,
             },
             "events": [event for ledger in ledgers for event in ledger.manifest["events"]],
             "attempt_count": sum(ledger.manifest["attempt_count"] for ledger in ledgers),
@@ -60,6 +77,10 @@ class Comparison(Ledger):
                     "run_id": ledger.manifest["run_id"],
                     "sealed_at": ledger.manifest["sealed_at"],
                     "targets": [target["name"] for target in ledger.manifest["plan"]["targets"]],
+                    "plan": {  # what this run did; the joined plan above fits none of them exactly
+                        key: ledger.manifest["plan"].get(key)
+                        for key in ("seeds", "repeats", "attempts_per_case", "case_count", "cases", "sample_seed")
+                    },
                     "stamp": ledger.stamp(),
                 }
                 for ledger in ledgers

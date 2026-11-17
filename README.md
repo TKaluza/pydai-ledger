@@ -3,7 +3,7 @@
 Reproducible, fully recorded batch runs of [Pydantic AI](https://ai.pydantic.dev) agents,
 built for vLLM servers and other OpenAI-compatible endpoints.
 
-**Status:** version 0.1, an early release. The API and the file formats may still change.
+**Status:** version 0.2, an early release. The API and the file formats may still change.
 Developed and tested on Linux; Windows is covered by the test suite in CI only.
 
 - [Installation](#installation)
@@ -43,39 +43,110 @@ book = Casebook.write("demo.casebook.zip", [Case(turns=["Say 'A'", "Say 'B'", "W
 plan = RunPlan(
     book,
     agent,
-    targets=[Target("gpu-a", model_a), Target("gpu-b", model_b)],
-    attempts_per_case=3,
-    concurrency=[1, 4, 16],
+    targets=[Target("gpu-a", model_a), Target("gpu-b", model_b)],  # or load_targets("targets.toml")
+    seeds=[1, 2],  # every case once per seed ...
+    repeats=2,  # ... and twice per seed: four attempts per case
+    sample=200,  # on 200 randomly drawn cases; leave out to run all
+    concurrency=8,  # per target; or {"gpu-a": 32, "gpu-b": 8}, or a Tuning from benchmark()
 )
 with Journal.open(plan, parent="tmp") as journal:
     await execute(plan, journal)
     ledger = journal.seal("demo.ledger.zip")
 
-ledger.agreement()  # same output across targets and repetitions?
-ledger.throughput()  # per target and concurrency level
+ledger.agreement()  # same output across targets, seeds and repeats?
 ledger.warnings()  # missing seed, temperature > 0, no /server_info
 ledger.to_parquet("demo.parquet")  # needs pydai-ledger[analysis]
 
 pack(book, [ledger], "demo.bundle.zip")  # inputs, runs and outputs in one file
-book, ledgers = open_bundle("demo.bundle.zip")
+with open_bundle("demo.bundle.zip") as bundle:
+    bundle.casebook, bundle.ledgers
 
-head = dict(title="Colour recognition", author="Tim", number="R-2026-007", date="2026-11-13")
-write_report(ledger, "demo.html", casebook=book, lang="de", **head)  # needs pydai-ledger[report]
-write_pdf(ledger, "demo.pdf", casebook=book, lang="de", **head)  # needs pydai-ledger[pdf]
+header = ReportHeader("Colour recognition", authors=["Tim"], number="R-2026-007")
+write_report(ledger, "demo.html", casebook=book, lang="de", header=header)  # needs pydai-ledger[report]
+write_pdf(ledger, "demo.pdf", casebook=book, lang="de", header=header)  # needs pydai-ledger[pdf]
 ```
 
-A complete script is in [examples/quickstart.py](examples/quickstart.py).
-[examples/synthetic_report.py](examples/synthetic_report.py) writes sample reports (HTML and
-PDF, English and German) into `reports/` from a pretend run and needs no server.
+Casebooks, ledgers, journals, bundles and benchmark results all work with `with` and have
+`close()`.
+
+Examples:
+
+- [examples/quickstart.py](examples/quickstart.py) – a complete small script.
+- [examples/validate.py](examples/validate.py) – the whole procedure against real servers
+  named in [examples/targets.toml](examples/targets.toml): benchmark, validation run on a
+  sample, one report per ledger.
+- [examples/synthetic_report.py](examples/synthetic_report.py) – the same with pretend
+  servers; writes the sample reports (HTML and PDF, English and German) into `reports/`.
+
+### Validation: what a run can show
+
+A run answers two separate questions. **Precision**: does the same come out again?
+**Trueness**: is it right? Both together are **accuracy**.
+
+The terms are taken from ISO 5725 ("Accuracy (trueness and precision) of measurement
+methods and results"), and the report is laid out along them: setup, precision,
+trueness, accuracy. pydai-ledger is oriented on the standard, it does not implement it:
+ISO 5725 is written for numeric measurements and their variances, here outputs are
+compared for identity and counted. Seed robustness is our name for what the standard
+calls intermediate precision, with the seed as the one factor that changes.
+
+| Condition | Term | Question | How to get it |
+|---|---|---|---|
+| Same seed, same target, several times | **Repeatability** | Does the same setup give the same output? | `repeats=2` or more |
+| Different seeds, same target | **Seed robustness** (intermediate precision) | Does the output depend on the seed? | `seeds=[1, 2]` |
+| Same model on another target | **Reproducibility** | Does another setup give the same output? | two targets with the same model |
+| Another model on another target | **Model comparison** | How alike do the models answer? | targets with different models |
+| Against the expected output | **Trueness** | Is the output right? | `expected=` in the cases |
+
+- Precision is the first three together, measured as the share of case turns with
+  identical outputs. A model comparison is not part of it, because two models may answer
+  differently; it has its own section. Whether two targets run the same model is read
+  from the model name.
+- Trueness is measured as the share of outputs that match the expected output, after
+  `normalize`. That fits structured and short outputs, not free text.
+- Accuracy classes every case turn per target as stable and right, stable but wrong
+  (a systematic deviation), or unstable (a random one). "Stable but wrong" is the case
+  that is easy to miss.
+- `seeds` and `repeats` multiply: `seeds=[1, 2], repeats=2` gives four attempts per case.
+  A seed replaces the one in the agent's model settings and is recorded with every request.
+- `sample=N` runs N randomly drawn cases (`sample_seed`, recorded). Precision is a property
+  of the setup, so a sample is usually enough. The report states the observed share and
+  draws no confidence bound from it: turns of one case are not independent of each other.
+  Use the same concurrency as in the full run, because what else is in a batch can matter.
+  Without `sample`, seeds and repeats apply to every case and validate the whole casebook.
+- For the full run afterwards, leave out `sample`, `seeds` and `repeats`: every case once.
+
+### Targets
+
+Every target gets all cases. Targets are independent, so they run side by side, each with
+its own `concurrency`; `sequential_targets=True` runs them one after another, for example
+when they share a GPU. `concurrency` only sets how fast a run is.
+
+Targets can be built in code or kept in a file, so no server address stands in a script:
+
+```toml
+[targets.gpu-a]
+model = "Qwen/Qwen3-32B"             # the served model name
+base_url = "http://gpu-a:8000/v1"    # an OpenAI-compatible endpoint
+api_key_env = "VLLM_API_KEY"         # optional: the variable that holds the key, never the key
+concurrency = 32                     # optional, for example what a benchmark recommended
+info = { gpu = "2x RTX 4090" }       # optional, stored verbatim with every run
+```
+
+```python
+targets = load_targets("targets.toml")
+```
+
+A plan without `concurrency` uses each target's own number, or 8.
 
 ### Options of `execute()`
 
 - `timeout=300` – seconds per turn; a slower turn is recorded as failed.
 - `max_consecutive_failures=20` – stop a target with `RunAbortedError` after that many
   failures in a row, or at once when its first request cannot reach the server.
-- `reset_prefix_cache=True` – call vLLM's `/reset_prefix_cache` before every stage
-  (dev mode). Off by default; a warning is recorded when it could matter.
-- `warmup=2` – run the first cases once per target before measuring, results discarded.
+- `reset_prefix_cache=True` – call vLLM's `/reset_prefix_cache` before a target starts
+  (dev mode). Off by default.
+- `warmup=2` – run the first cases once per target before its attempts, results discarded.
   Off by default.
 - `probe_capabilities=True` – three small requests per HTTP target before the run to
   record whether tool output, native JSON-schema output and image input work. On by default.
@@ -106,8 +177,8 @@ on_missing = "error"        # or "warning"
 - **Notes.** Every note has a code and a default level: `stopped`, `incomplete`,
   `failed_attempts`, `invalid_signature` are errors; `no_seed`, `no_temperature`,
   `temperature_nonzero`, `provider_only`, `prefix_cache_reset_failed` are warnings;
-  `prefix_cache_not_reset` is information and stands with the throughput figures, because it
-  does not touch the answers. The HTML report explains each note under "Background".
+  `prefix_cache_not_reset` is information and stands with the throughput figures of a
+  benchmark report, because it does not touch the answers. The HTML report explains each note under "Background".
   A report names the notes that the configuration hides.
 - **Determinism points.** `temperature_zero`, `request_seed`, `server_seed`,
   `batch_invariant` (`VLLM_BATCH_INVARIANT=1`), `prefix_cache_neutral`, `single_gpu`,
@@ -118,9 +189,9 @@ on_missing = "error"        # or "warning"
   raises `DeterminismError` before the first attempt when a required point is missing.
   With `"warning"` the run starts and the report shows the gap.
 - The points are preconditions. Whether outputs really were identical is measured: see
-  agreement across repetitions and concurrency levels in the report.
+  precision in the report.
 
-- **Server must not change.** After every stage `execute()` asks the server again for its
+- **Server must not change.** When a target is through, `execute()` asks the server again for its
   version and models. If either differs from the start (restart, update, another model),
   the target is stopped with `RunAbortedError` and the report shows an error.
 
@@ -141,35 +212,66 @@ with Comparison([Ledger.open("vllm.ledger.zip"), Ledger.open("other.ledger.zip")
 The comparison is a view; nothing is written or re-signed. The report lists the stamp of
 every run in the run details, and its own QR code is a hash over those stamps.
 
-### Autotune
+### Benchmark
+
+Finding the fastest concurrency is a step of its own, apart from a run. It has its own
+ledger and its own report, and what it hands on is a recommendation.
 
 ```python
-tune = await autotune(book, agent, target, "tune.ledger.zip", sample=64)
-tune.best  # concurrency with the highest throughput
-tune.levels  # [{"concurrency": 1, "rate": 29.1}, ...] in output tokens per second
+with await benchmark(book, agent, target, "gpu-a.benchmark.zip") as tune:
+    tune.best  # recommended concurrency
+    tune.levels  # [{"concurrency": 1, "rate": 29.1, "cases": 32}, ...] in output tokens per second
+    write_pdf(tune.ledger, "benchmark.pdf")  # throughput, latency, server means, recommendation
+    plan = RunPlan(book, agent, [target], concurrency=tune.tuning)
+
+Ledger.open("gpu-a.benchmark.zip").tuning()  # the recommendation again, any time later
 ```
 
-Runs the first `sample` cases at 1, 2, 4, 8, ... parallel requests and stops as soon as
-a level is not at least `min_gain=0.05` faster than the best before it. The prefix cache
-is reset before every level, because all levels run the same cases. The measurements
-are an ordinary ledger and can be reported like any run.
+- The benchmark draws the cases itself, at random with `seed=0`, and records which. Level
+  `c` runs the first `rounds * c` drawn cases (`rounds=10`, at least 32), so every slot is
+  filled about ten times.
+- Levels are 1, 2, 4, ... up to `max_concurrency=128`. The search stops earlier as soon as
+  a level is not at least `min_gain=0.05` faster than the best before it, or when a level
+  would need more cases than the casebook has (concurrency above a tenth of the cases).
+- The prefix cache is reset before every level, because lower levels run a subset of the
+  cases of higher ones. For the same reason the report can say, at no extra cost, whether
+  the outputs were identical at every level.
+- The recommendation (`Tuning`) lives in the benchmark ledger and names the model, provider
+  and target it was measured on. It is a recommendation only: a `RunPlan` accepts it for any
+  target, also on another server or provider, without a warning, and records where its
+  concurrency came from. To keep the number, write it as `concurrency` into your targets file.
 
 ### Reports
 
 `write_report()` writes one self-contained HTML file, `write_pdf()` a printable PDF
-(typeset with Typst). Both show the same figures in English or German (`lang="en" | "de"`):
-key figures, warnings, a models table (server, GPU, context, weights, capabilities),
-throughput per concurrency level, vLLM's own means per stage, agreement between targets,
-and the cases.
+(typeset with Typst), in English or German (`lang="en" | "de"`). Every report covers one ledger; what
+it is follows from the ledger:
 
-- `title`, `author`, `number` and `date` head the report; the date defaults to the sealing time.
+| Given | Report | Shows |
+|---|---|---|
+| a run ledger | **run report** | validation along ISO 5725 (setup, precision, trueness, accuracy), model comparison, execution, cases |
+| a benchmark ledger | **benchmark report** | recommended concurrency, latency over throughput as one curve, figures per level, vLLM's own means |
+
+```python
+write_pdf(run, "run.pdf", casebook=book, header=header)
+write_pdf(bench.ledger, "benchmark.pdf", header=header)
+write_pdf(run, "targets.pdf", sections=["targets"])  # only models, hardware and server details
+```
+
+- `sections` limits a report to some of `"targets"`, `"benchmark"`, `"validation"`, `"cases"`.
+- Every report is headed by key figures, including attempts per minute as an overall
+  impression: of the whole run in a run report, at the recommended concurrency in a
+  benchmark report.
+- `header=ReportHeader(title, authors, number, date, organisation)` heads all of them alike;
+  the date defaults to the sealing time.
+- All text is black and table heads are bold, so a print is clean; remarks are set in italics.
+- The HTML report opens light; a switch at the top right turns it dark. Print is always light.
 - `normalize=casefold` (or your own function) is applied to outputs before they are compared,
   so "blue" and "Blue" count as equal. `ledger.agreement(casefold)` does the same in code.
-- PDF `style`: `"plain"` (space only, default), `"ruled"` (one line under table headers) or
-  `"banded"` (shaded rows).
-- Figures follow scientific practice: one figure with panels (a) to (c), a shared legend, axes
-  with arrows, quantity and unit, and a numbered caption below. They are left out when a run
-  has a single concurrency level.
+- PDF tables have no lines; every other row is shaded.
+- Figures follow scientific practice: a legend, axes with arrows, quantity and unit, and a
+  numbered caption below. The benchmark figure plots latency over throughput, one point
+  per concurrency level; it is left out when only one level was measured.
 - A result grid shows every case per target as a green, yellow or red cell. In the HTML report a
   cell shows its case on hover and opens it in the case table on click.
 - The PDF footer names report number, run, manifest hash and date on every page, so a single
@@ -182,7 +284,7 @@ and the cases.
   A further appendix prints what every server reported: `/server_info` with vLLM
   configuration, environment variables, GPU and library versions.
 - Image previews for the first `max_images=30` images (needs Pillow).
-- Fonts are bundled: Jost for text, Ubuntu Mono for code and numbers
+- Fonts are bundled: Lato for text, Ubuntu Mono for code and numbers
   (see `src/pydai_ledger/fonts/` for their licences).
 - A QR code carries the ledger stamp (see below).
 
@@ -233,6 +335,25 @@ does not prove that a server really produced the recorded outputs.
 
 ### Known limits
 
+- Ledgers written by pydai-ledger 0.1.x are not read by 0.2 (ledger format version 2);
+  open them with 0.1.1.
+- One target, one server. Every attempt records the server it ran on (version and served
+  models). When the server has changed since, `execute()` runs those attempts again on
+  the server as it is now, and `seal()` refuses a run whose successful attempts come from
+  different servers. A server that is swapped for one with the same version and models
+  cannot be told apart.
+- A target that stopped makes the run incomplete even when every attempt is there. When
+  its server changed during a stage, that whole stage runs again before the run can be
+  sealed as complete. The stop stays in the ledger and in the report.
+- When several workers recorded the same attempt, the one that ended last counts.
+- A benchmark measures whole stages. A stage that stopped, broke off or had no successful
+  attempt runs again as a whole when the benchmark is resumed. All levels are ranked in
+  one unit: output tokens per second only when every level reported tokens, else attempts
+  per second. Without a level that has a successful attempt, `benchmark()` raises.
+- The determinism point for the prefix cache reads what was recorded. A reset that was
+  asked for but failed counts as not done; when the point is required, the run stops.
+- A comparison of runs with different seeds or repeats states the setup of every run on
+  its own line and lists the cases of all of them.
 - Agents with `deps` are not supported yet.
 - The capability check sends one turn. A model can pass it for tool output and still
   answer in plain text in a later turn of a conversation; `NativeOutput` avoids that.
@@ -271,7 +392,8 @@ answer are kept in two kinds of files that never change after they are written.
 | Part | What it is | Changes? |
 |---|---|---|
 | **Casebook** | The task: cases with one or more user turns, images, optional expected outputs, keys and metadata. Knows nothing about agent, model or server. | never |
-| **RunPlan** | Casebook × agent × targets × concurrency levels × repetitions. Its hash names the run. | in memory only |
+| **RunPlan** | Casebook (or a sample of it) × agent × targets × seeds × repeats. Its hash names the run. | in memory only |
+| **Targets file** | Optional TOML file that names the servers: model, endpoint, concurrency, notes. | yours to edit |
 | **Journal** | Working directory of a run in progress; one append-only file per worker. | grows until sealed |
 | **Ledger** | The sealed result of one plan. Refers to its casebook by hash. | never |
 | **Bundle** | Casebook and any number of its ledgers in one file. | never |
@@ -283,13 +405,24 @@ answer are kept in two kinds of files that never change after they are written.
 | **Case** | One conversation to run: one or more user turns, optionally with images and expected outputs. |
 | **Turn** | One user message and the model's answer to it. Later turns see the whole history. |
 | **Target** | One model on one server, with a name of your choice. Reports compare targets. |
-| **Attempt** | One execution of one case on one target at one concurrency level. Repetitions are further attempts. |
-| **Concurrency level** | How many attempts are in flight at once. Each level is its own **stage**, measured separately. |
-| **Stage** | All attempts of one target at one concurrency level. |
+| **Attempt** | One execution of one case on one target with one seed. A case has seeds × repeats attempts per target. |
+| **Repeat** | A further attempt under the same conditions, same seed included. Not the re-run of a failed attempt on resume, which replaces it. |
+| **Sample** | A random, recorded selection of cases that a run is limited to. |
+| **Concurrency** | How many attempts are in flight at once on one target. Sets the speed of a run. It can also change outputs when the server is not batch invariant, so validate at the concurrency of the full run. |
+| **Benchmark** | The step that measures one target: random cases at rising concurrency levels. Each level is a **stage**, measured separately. |
+| **Tuning** | What a benchmark recommends: a concurrency, with the model and provider it was measured on. Lives in the benchmark ledger. |
+| **Stage** | All attempts of one target at one concurrency. A run has one per target, a benchmark one per level. |
 | **Output** | The final result of a turn, as validated by Pydantic AI (text or structured data). |
-| **Expected output** | What a turn should return, stored in the casebook. "As expected" counts matches. |
-| **Agreement / identical outputs** | Share of turns for which all successful attempts, across targets, repetitions and levels, returned the same output. |
-| **Throughput** | Successful attempts per second and output tokens per second of a stage, by wall time. |
+| **Expected output** | What a turn should return, stored in the casebook. Trueness counts matches. |
+| **Precision** | Repeatability, seed robustness and reproducibility together: one model gives one output per case turn. Measured as the share of case turns for which the compared attempts returned the same output. |
+| **Repeatability** | Same target, same seed, several attempts: the same output every time. |
+| **Seed robustness** | Same target, different seeds: the same output for every seed. |
+| **Reproducibility** | Same model on different targets: the same output on each. |
+| **Model comparison** | Agreement between targets with different models. Informative, not part of precision. |
+| **Trueness** | Share of outputs that match the expected output. Independent of precision. |
+| **Accuracy** | Precision and trueness together: stable and right, stable but wrong, unstable. |
+| **Validation** | Establishing the accuracy of a setup, usually on a sample with several seeds and repeats. |
+| **Throughput** | Successful attempts per second and output tokens per second of a stage, by wall time. Reported by a benchmark. |
 | **Latency** | Duration of one attempt (all its turns); mean, median (p50) and 95th percentile (p95). |
 | **Output mode** | How structured output is requested: `tool` (tool call), `native` (JSON schema enforced by the server), `text`. |
 | **Capabilities** | Whether tool output, native output and image input worked in three small test requests before the run. |
@@ -297,7 +430,7 @@ answer are kept in two kinds of files that never change after they are written.
 | **provider_only** | No `/server_info` was available, so only model name and base URL identify the server. |
 | **Note** | A finding about the run with a level: error (result affected), warning (comparability limited), information (context). |
 | **Determinism point** | One precondition for bit-identical outputs, such as temperature 0 or batch invariance. |
-| **Prefix cache** | The server keeps computed prompt beginnings; repeated prompts get faster. Affects speed, not answers. |
+| **Prefix cache** | The server keeps computed prompt beginnings; repeated prompts get faster. Meant to affect speed only; whether it is neutral is one of the determinism points. |
 | **Batch invariance** | vLLM option that makes an output independent of what else is in the same batch; costs throughput. |
 | **Run id** | Hash of the plan. The same plan always has the same id, which makes a run resumable. |
 | **Stamp** | Short identifier of a ledger: run id, manifest hash and, if signed, key and signature. Printed as QR code. |
@@ -312,20 +445,26 @@ well as 150,000 images.
 1. **Define** – write the cases to a casebook. Each case gets the hash of its turns as
    id; the casebook id is the hash of all case ids.
 2. **Plan** – combine casebook, agent and targets. The plan id is the hash of the
-   casebook id, the agent fingerprint, the targets, the levels and the repetitions.
+   casebook id, the agent fingerprint, the targets, seeds, repeats, sample and concurrency.
    The same plan always leads to the same journal, which makes a run resumable.
 3. **Probe** – per target: `/server_info`, `/version`, `/v1/models`, and three small
    requests for capabilities.
-4. **Warm up** (optional) – a few unrecorded cases so model loading is not measured.
-5. **Execute** – per target one stage per concurrency level, one after another; targets
-   run side by side. Server metrics are read before and after each stage. Every attempt
-   is written to the journal the moment it ends.
+4. **Warm up** (optional) – a few unrecorded cases so model loading stays out.
+5. **Execute** – every target runs all planned cases, seeds × repeats times; targets run side
+   by side unless `sequential_targets` is set. Every attempt is written to the journal the
+   moment it ends.
 6. **Resume** – calling `execute()` again skips successful attempts and repeats failed
    and missing ones.
 7. **Seal** – the latest record of every attempt goes into the ledger with hashes of
    all parts; optionally signed. The journal is deleted only after that.
-8. **Analyse and report** – agreement, throughput, Parquet export, HTML and PDF.
+8. **Analyse and report** – precision, trueness, Parquet export, HTML and PDF.
 9. **Pack** (optional) – casebook and ledgers into one bundle for hand-over.
+
+A benchmark is a separate step before or beside this: `benchmark()` measures one target,
+seals a benchmark ledger and yields a `Tuning` that step 2 can take as `concurrency`.
+
+The usual order for a new setup: benchmark every target, validate on a sample with seeds
+and repeats, then do the full run once. Each of them gets its own report.
 
 ### What is recorded
 
@@ -338,10 +477,11 @@ well as 150,000 images.
 | Client | Platform, Python version, versions of pydai-ledger, pydantic-ai, pydantic, openai, httpx2; the options `execute()` was called with. |
 | Each request | Merged settings as sent (temperature, seed, ...), tool and output definitions (once per distinct set), duration. |
 | Each turn | All new messages including tool calls and results, output, token usage, model name returned by the server, finish reason, start time, duration. |
-| Each attempt | Target, concurrency level, case, repetition, worker, status, error text and kind (`api`, `timeout`, `run`), start and end. |
+| Each attempt | Target, concurrency, case, attempt number with its seed and repeat, worker, status, error text and kind (`api`, `timeout`, `run`), start and end. |
 | Each stage | Start, end, wall time, attempts, output tokens, whether the prefix cache was reset, all `/metrics` samples before and after. |
+| Benchmark | The drawn cases and their order, the levels, the rate per level, the recommended and the skipped levels. |
 | Configuration | The settings of `pydai-ledger.toml` in force when `execute()` ran. |
-| Run | Warnings, warm-up, autotune decision, early stops, hashes of all parts, signature. |
+| Run | Warnings, warm-up, early stops, hashes of all parts, signature. |
 
 ### What is not recorded, and what to do about it
 

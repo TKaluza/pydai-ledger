@@ -1,6 +1,6 @@
 [project]
 name = "pydai-ledger"
-version = "0.1.1"
+version = "0.2.0"
 description = "Reproducible, fully recorded batch runs of Pydantic AI agents (casebook in, ledger out)."
 readme = "README.md"
 license = "MIT"

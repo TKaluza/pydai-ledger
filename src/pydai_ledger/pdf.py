@@ -12,22 +12,22 @@ import base64
 import json
 import os
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
 from .casebook import Casebook
 from .config import Config
+from .header import ReportHeader
 from .ledger import Ledger
 from .report import FONTS
-from .summary import GRID_COLOURS, MAX_SERIES, PRINT_PALETTE, _panel, _result_grid, build
+from .summary import GRID_COLOURS, MAX_SERIES, PRINT_PALETTE, _curve, _result_grid, build
 
 _TEMPLATE = r"""
 #let d = json("data.json")
 #let L = d.L
-#let style = d.style
 #let ink = rgb("#111111")
-#let soft = rgb("#5a5a5a")
+#let soft = ink  // all text is black, so a print is clean; emphasis comes from size, weight and italics
 #let red = rgb("#c0392b")
 #let amber = rgb("#a86b00")
 #let green = rgb("#1a7f37")
@@ -52,13 +52,13 @@ _TEMPLATE = r"""
   },
 )
 // Type: one family, two weights, four sizes (title, heading, body, small).
-#set text(font: ("Jost", "New Computer Modern"), size: 9.5pt, fill: ink, lang: d.lang)
+#set text(font: ("Lato", "New Computer Modern"), size: 9.5pt, fill: ink, lang: d.lang)
 #set par(leading: 0.55em)
 #show raw: set text(font: mono, size: 8.5pt)
 // Emphasis is either size or weight, never both: title and headings are larger and
-// regular, sub-headings and case ids are body size and semibold.
+// regular, sub-headings and case ids are body size and bold.
 #show heading.where(level: 1): it => block(above: 22pt, below: 9pt, sticky: true, text(13pt, weight: "regular", it.body))
-#show heading.where(level: 2): it => block(above: 12pt, below: 5pt, sticky: true, text(9.5pt, weight: "semibold", it.body))
+#show heading.where(level: 2): it => block(above: 12pt, below: 5pt, sticky: true, text(9.5pt, weight: "bold", it.body))
 
 #let small(body) = text(8pt, fill: soft, body)
 
@@ -68,8 +68,10 @@ _TEMPLATE = r"""
   if calc.rem(calc.quo(flags, 2), 2) == 1 { text(fill: amber)[D ] }
   if calc.quo(flags, 4) == 1 { text(fill: red)[X] }
 }
-// Table heads: with shaded rows the head is already set apart, so it stays regular.
-#let th(h) = if style == "banded" { text(fill: soft, h) } else { text(weight: "semibold", h) }
+#let th(h) = text(weight: "bold", h)
+// A caption above a table, with room above it; a remark is a sentence about how something ran.
+#let cap(body) = block(above: 15pt, below: 5pt, sticky: true, small(body))
+#let remark(body) = block(above: 6pt, text(8.5pt, style: "italic", body))
 // A figure: content, then a numbered caption below it.
 #let fig(number, caption, body) = block(width: 100%, above: 6pt, below: 10pt, breakable: false)[
   #body
@@ -78,16 +80,14 @@ _TEMPLATE = r"""
 ]
 #let key(colour, name) = { box(baseline: -0.5pt, rect(width: 7pt, height: 5pt, fill: rgb(colour))); h(3pt); small(name); h(10pt) }
 
-// Tables: no vertical lines. "plain" separates by space alone, "ruled" adds one line
-// under the header, "banded" shades every other row.
-#let head-stroke(y) = if style == "ruled" and y == 0 { (bottom: 0.5pt + ink) } else { none }
-#let row-fill(y) = if style == "banded" and y > 0 and calc.odd(y) { band } else { none }
+// Tables: no lines at all; every other row is shaded.
+#let row-fill(y) = if y > 0 and calc.odd(y) { band } else { none }
 #let tbl(t, size: 8.5pt) = {
   set text(size)
   table(
     columns: t.cols.map(c => if c == 0 { auto } else { c * 1fr }),
     align: (x, y) => if t.align.at(x) == "r" { right } else if t.align.at(x) == "c" { center } else { left },
-    stroke: (x, y) => head-stroke(y),
+    stroke: none,
     fill: (x, y) => row-fill(y),
     inset: (x: 4pt, y: 3pt),
     table.header(..t.head.map(th)),
@@ -125,7 +125,7 @@ _TEMPLATE = r"""
       grid.cell(
         stroke: (left: 2pt + if n.level == "error" { red } else if n.level == "warning" { amber } else { soft }),
         inset: (left: 6pt, y: 1pt),
-        text(weight: "semibold", n.code),
+        text(weight: "bold", n.code),
       ),
       grid.cell(inset: (y: 1pt), n.text),
     )).flatten(),
@@ -134,53 +134,99 @@ _TEMPLATE = r"""
 #notes(d.notes.filter(n => n.section == ""))
 #if d.config_line != "" { small(d.config_line) }
 
-= #L.models
-#block(below: 3pt, small(L.hardware_title))
-#tbl(d.models)
-#block(above: 9pt, below: 3pt, small(L.setup_title))
-#tbl(d.capabilities)
-
-= #L.throughput
-#block(sticky: true, notes(d.notes.filter(n => n.section == "throughput")))
-#if d.charts.len() > 0 {
-  fig(d.chart_number, d.chart_caption)[
-    #for s in d.series { key(s.at(1), s.at(0)) }
-    #grid(columns: (1fr, 1fr, 1fr), column-gutter: 5pt, ..d.charts.map(c => image(c, width: 100%)))
-  ]
-}
-#tbl(d.throughput)
-#for line in d.lines { small(line); linebreak() }
-#if d.server != none [
-  == #L.server_means
-  #tbl(d.server)
+#if d.show.targets [
+  = #L.models
+  #block(below: 5pt, small(L.hardware_title))
+  #tbl(d.models)
+  #cap(L.setup_title)
+  #tbl(d.capabilities)
 ]
 
-// Compact matrix: as wide as its content; a cell darkens as agreement falls below 100 %.
-#let shade(v) = if v == none { none } else { amber.transparentize(calc.max(0%, 100% - (1 - v) * 400%)) }
-#block(breakable: false)[
-  = #L.agreement
-  #small(L.agreement_note)
-  #set text(8.5pt)
-  #{
-  let n = d.targets.len()
+#if d.show.benchmark [
+  = #L.throughput
+  #block(sticky: true, notes(d.notes.filter(n => n.section == "throughput")))
+  #if d.curve != none {
+    fig(d.chart_number, d.chart_caption)[
+      #for s in d.series { key(s.at(1), s.at(0)) }
+      #align(center, image(d.curve, width: 82%))
+    ]
+  }
+  #v(6pt)
+  #tbl(d.throughput)
+  #if d.tuning != none [
+    #cap(L.result_title)
+    #tbl(d.tuning)
+  ]
+  #if d.server != none [
+    == #L.server_means
+    #tbl(d.server)
+  ]
+]
+
+// Reproducibility between targets with one model, as wide as its content. A cell turns
+// amber as the share of identical outputs falls below 100 %.
+#let shade(v) = amber.transparentize(calc.max(0%, 100% - (1 - v) * 400%))
+#let matrix(b) = {
+  set text(8.5pt)
   table(
-    columns: (auto,) * (n + 1),
+    columns: (auto,) * (b.targets.len() + 1),
     align: (x, y) => if x == 0 { left } else { right },
     stroke: none,
     inset: (x: 6pt, y: 3.5pt),
-    fill: (x, y) => if x > 0 and y > 0 { shade(d.matrix_values.at(y - 1).at(x - 1)) } else { none },
-    table.header([], ..d.targets.map(t => text(fill: soft, t))),
-    ..d.matrix.rows.map(r => (text(fill: soft, r.at(0)), ..r.slice(1).map(c => text(font: mono, c)))).flatten(),
+    fill: (x, y) => if x > 0 and y > 0 {
+      let v = b.values.at(y - 1).at(x - 1)
+      if v != none and v < 1 { shade(v) } else { none }
+    } else { none },
+    table.header([], ..b.targets.map(th)),
+    ..b.targets.enumerate().map(((y, name)) => (th(name), ..b.rows.at(y).map(c => text(font: mono, c)))).flatten(),
   )
+}
+// The preconditions for identical outputs: one line per point, set in two columns.
+#let det(items) = {
+  set text(8.5pt)
+  block(above: 7pt, grid(
+    columns: (auto, 1fr, auto, 1fr),
+    column-gutter: (7pt, 16pt, 7pt),
+    row-gutter: 6pt,
+    ..items.map(i => (
+      text(font: mono, fill: if i.state == "on" { green } else if i.state == "off" { red } else if i.state == "mixed" { amber } else { soft }, i.word),
+      [#i.label#if i.required [ #text(fill: soft)[(#L.d_required)]]#if i.value != "" [ #h(3pt)#text(7.5pt, font: mono, fill: soft, i.value)]],
+    )).flatten(),
+  ))
+}
+// Validation after ISO 5725: setup, precision, trueness, accuracy, block by block.
+#if d.show.validation [
+= #L.validation
+#for b in d.validation {
+  if b.kind == "h2" { heading(level: 2, b.text) }
+  else if b.kind == "text" { block(above: 5pt, below: 5pt, small(b.text)) }
+  else if b.kind == "det" { det(b.items) }
+  else {
+    block(breakable: false)[
+      #if b.cap != none { cap(b.cap) } else { v(2pt) }
+      #if b.kind == "matrix" { matrix(b) } else { tbl(b.table) }
+    ]
   }
+}
+#if d.model_pairs != none [
+  #block(breakable: false)[
+    = #L.model_comparison
+    #block(below: 5pt, small(L.model_comparison_note))
+    #tbl(d.model_pairs)
+  ]
 ]
-#block(breakable: false, tbl(d.per_target))
+#block(breakable: false)[
+  = #L.execution_title
+  #tbl(d.per_target)
+  #if d.execution != "" { remark(d.execution) }
+]
+]
 
 // ---- notable cases ---------------------------------------------------------
 // One case is one block: its id stands at the far left, every turn is a row with the
 // prompt on the left and the outputs on the right.
 #let case-block(c, shaded) = {
-  let id = [#text(weight: "semibold", c.id) #h(3pt) #marks(c.f)]
+  let id = [#text(weight: "bold", c.id) #h(3pt) #marks(c.f)]
   let body = {
     for (n, t) in c.t.enumerate() {
       grid(
@@ -208,41 +254,22 @@ _TEMPLATE = r"""
   block(
     breakable: false, width: 100%, above: 10pt, below: 0pt,
     fill: if shaded { band } else { none },
-    inset: if style == "banded" { 4pt } else { 0pt },
-    if style == "ruled" {
-      grid(columns: (26mm, 1fr), column-gutter: 5pt, text(8.5pt, id), body)
-    } else {
-      grid(columns: (6mm, 1fr), column-gutter: 4pt, rotate(-90deg, reflow: true, text(8.5pt, id)), body)
-    },
+    inset: 4pt,
+    grid(columns: (6mm, 1fr), column-gutter: 4pt, rotate(-90deg, reflow: true, text(8.5pt, id)), body),
   )
 }
+#if d.show.validation [
 = #L.results
 #fig(d.grid_number, d.grid_caption)[
   #for k in d.grid_keys { key(k.at(0), k.at(1)) }
   #image("grid.svg", width: 100%)
 ]
-
-// ---- determinism: one line per point, set in two columns -------------------------
-#block(breakable: false)[
-  = #L.determinism
-  #small(d.determinism.summary)
-  #v(3pt)
-  #set text(8.5pt)
-  #grid(
-    columns: (auto, 1fr, auto, 1fr),
-    column-gutter: (7pt, 16pt, 7pt),
-    row-gutter: 6pt,
-    ..d.determinism.items.map(i => (
-      text(font: mono, fill: if i.state == "on" { green } else if i.state == "off" { red } else if i.state == "mixed" { amber } else { soft }, i.word),
-      [#i.label#if i.required [ #text(fill: soft)[(#L.d_required)]]#if i.value != "" [ #h(3pt)#text(7.5pt, font: mono, fill: soft, i.value)]],
-    )).flatten(),
-  )
 ]
 
 #if d.notable.len() > 0 [
   = #L.notable
   #block(sticky: true, small(d.notable_note))
-  #for (n, c) in d.notable.enumerate() { case-block(c, style == "banded" and calc.odd(n)) }
+  #for (n, c) in d.notable.enumerate() { case-block(c, calc.odd(n)) }
 ]
 
 // ---- appendix A ------------------------------------------------------------
@@ -256,10 +283,9 @@ _TEMPLATE = r"""
     table(
       columns: (auto, auto, 2fr) + d.targets.map(t => 3fr) + (auto, auto),
       align: (x, y) => if x == 0 or x >= 3 + d.targets.len() { right } else { left },
-      stroke: (x, y) => head-stroke(y),
+      stroke: none,
       fill: (x, y) => row-fill(y),
-      // "plain" groups the rows in fives by a little extra space instead of lines
-      inset: (x, y) => (x: 3pt, bottom: 1.8pt, top: if style == "plain" and y > 1 and calc.rem(y - 1, 5) == 0 { 6pt } else { 1.8pt }),
+      inset: (x: 3pt, y: 1.8pt),
       table.header(..(("#", "", L.js_prompt.split(" ").first()) + d.targets + ("s", "tok")).map(th)),
       ..d.all.map(r => ([#r.at(0)], marks(r.at(1)), [#r.at(2)]) + r.at(3).map(o => [#o]) + ([#r.at(4)], [#r.at(5)])).flatten(),
     )
@@ -296,7 +322,7 @@ _TEMPLATE = r"""
     == #s.name
     #if s.note != none { small(s.note) }
     #for sec in s.sections {
-      block(above: 10pt, below: 4pt, sticky: true, text(8.5pt, weight: "semibold", sec.title))
+      block(above: 10pt, below: 4pt, sticky: true, text(8.5pt, weight: "bold", sec.title))
       if sec.kind == "rows" {
         let body = {
           set text(7pt, font: mono)
@@ -322,7 +348,7 @@ _TEMPLATE = r"""
   #small(L.full_note)
   // two columns keep the lines near 60 characters, which long text needs to stay readable
   #columns(2, gutter: 8mm, for c in d.full {
-    block(above: 14pt, below: 4pt, sticky: true)[#text(weight: "semibold", c.id) #h(3pt) #marks(c.f)]
+    block(above: 14pt, below: 4pt, sticky: true)[#text(weight: "bold", c.id) #h(3pt) #marks(c.f)]
     for (n, t) in c.t.enumerate() {
       block(above: 8pt, below: 3pt, sticky: true, small[#L.turn #(n + 1) · #L.prompt])
       for p in t.p { par(text(8pt, lines(p))) }
@@ -411,33 +437,29 @@ def write_pdf(
     all_cases: bool = True,
     max_images: int = 30,
     thumbnail_px: int = 256,
-    title: str | None = None,
-    author: str | None = None,
-    number: str | None = None,
-    date: str | None = None,
+    header: ReportHeader | None = None,
+    sections: Sequence[str] | None = None,
     paper: str = "a4",
-    style: str = "plain",
     excerpt_chars: int = 240,
     normalize: Callable[[Any], Any] | None = None,
     config: str | os.PathLike[str] | Config | None = None,
 ) -> Path:
     """Write the PDF report of ``ledger`` to ``path``.
 
-    ``title``, ``author``, ``number`` (your own report or run number) and ``date`` head
-    the report; the date defaults to the time the ledger was sealed.
+    ``header`` is a :class:`ReportHeader` with title, authors, number and date. As
+    with :func:`pydai_ledger.write_report`, a run ledger gives the run report and a
+    benchmark ledger the benchmark report; ``sections`` limits either.
     ``lang`` is ``"en"`` or ``"de"``. The PDF holds a one-page summary with the ledger
-    stamp as QR code, throughput, agreement, up to ``max_notable`` notable cases in
+    stamp as QR code, the validation (precision, trueness, accuracy), up to ``max_notable`` notable cases in
     detail (failed, differing, not as expected) and, with ``all_cases``, a dense table
-    of every case. ``style`` chooses how tables and cases are set: ``"plain"`` (space
-    only), ``"ruled"`` (one line under table headers) or ``"banded"`` (shaded rows).
-    Prompts and outputs longer than ``excerpt_chars`` are shortened in the notable
+    of every case. For the ledger of a :func:`pydai_ledger.benchmark` it is the
+    benchmark report instead: latency over throughput per concurrency level and the
+    recommendation, without cases. Prompts and outputs longer than ``excerpt_chars`` are shortened in the notable
     cases; their full text follows in the last appendix. An appendix lists what every
     server reported (``/server_info``, when vLLM runs in dev mode). ``config`` sets the
     level of each note, see :func:`pydai_ledger.write_report`.
     Needs ``pydai-ledger[pdf]``; image previews need Pillow.
     """
-    if style not in ("plain", "ruled", "banded"):
-        raise ValueError(f"Unknown style {style!r}; use 'plain', 'ruled' or 'banded'.")
     try:
         import typst
     except ImportError as exc:
@@ -447,10 +469,8 @@ def write_pdf(
         ledger,
         casebook,
         lang=lang,
-        title=title,
-        author=author,
-        number=number,
-        date=date,
+        header=header,
+        sections=sections,
         max_images=max_images,
         thumbnail_px=thumbnail_px,
         normalize=normalize,
@@ -463,21 +483,21 @@ def write_pdf(
         if lang == "de"
         else (lambda v, d: "–" if v is None else f"{v:,.{d}f}")
     )
-    flagged = [c for c in payload["cases"] if c["f"]]
+    flagged = [c for c in payload["cases"] if c["f"]] if S["show"]["cases"] else []
 
     with tempfile.TemporaryDirectory(prefix="pydai-ledger-pdf-") as folder:
         root = Path(folder)
         for index, uri in enumerate(payload["thumbs"]):
             (root / f"thumb{index}.jpg").write_bytes(base64.b64decode(uri.split(",", 1)[1]))
-        charts = []
-        for index, chart in enumerate(S["charts"]):
-            svg = _panel(
-                chart["label"], chart["y_label"], L["axis_concurrency"], S["levels"], chart["series"], bare=True
-            )
-            (root / f"chart{index}.svg").write_text(svg, encoding="utf-8")
-            charts.append(f"chart{index}.svg")
-        grid_svg, per_cell = _result_grid(S["states"], L["axis_case"], bare=True)
-        (root / "grid.svg").write_text(grid_svg, encoding="utf-8")
+        curve = None
+        if S["curve"]:
+            (root / "curve.svg").write_text(_curve(**S["curve"], bare=True), encoding="utf-8")
+            curve = "curve.svg"
+        per_cell = 1
+        all_cases = all_cases and S["show"]["cases"]
+        if S["show"]["validation"]:
+            grid_svg, per_cell = _result_grid(S["states"], L["axis_case"], bare=True)
+            (root / "grid.svg").write_text(grid_svg, encoding="utf-8")
         letters = dict(zip(("all", "run", "server", "full"), "ABCD" if all_cases else " ABC", strict=True))
         qr = None
         try:
@@ -558,9 +578,14 @@ def write_pdf(
         document = {
             "L": L,
             "lang": S["lang"],
-            "style": style,
+            "benchmark": S["benchmark"],
+            "execution": S["execution"],
             "author": S["author"],
-            "head": [" · ".join(part for part in (S["number"], S["date"], S["author"]) if part), S["status"]],
+            "head": S["head"],
+            "show": S["show"],
+            "validation": S["validation"],
+            "verdict": S["verdict"],
+            "model_pairs": S["model_pairs"],
             "title": S["title"],
             "paper": paper,
             "run": S["number"] or f"{L['run']} {S['run_id'][:12]}",
@@ -574,8 +599,6 @@ def write_pdf(
                 )
                 if part
             ),
-            "matrix_values": S["matrix_values"],
-            "meta": S["meta"],
             "qr": qr,
             "stamp": S["stamp"],
             "facts": S["facts"],
@@ -584,16 +607,15 @@ def write_pdf(
                 for n in S["notes"]
             ],
             "config_line": S["config_line"],
-            "determinism": S["determinism"],
-            "servers": _servers(S),
+            "servers": _servers(S) if S["show"]["targets"] else [],
             "runs": S["runs"],
             "models": S["models"],
             "capabilities": S["capabilities"],
-            "series": [[name, PRINT_PALETTE[i]] for i, name in enumerate(targets[:MAX_SERIES])],
-            "charts": charts,
+            "series": [[name, PRINT_PALETTE[i]] for i, name in enumerate(S["series_names"][:MAX_SERIES])],
+            "curve": curve,
             "chart_number": 1,
             "chart_caption": S["chart_caption"],
-            "grid_number": 2 if charts else 1,
+            "grid_number": 2 if curve else 1,
             "grid_caption": L["fig_grid"].format(agg=L["grid_agg"].format(k=per_cell) if per_cell > 1 else "")
             + (L["grid_rows"].format(names=", ".join(targets)) if len(targets) > 1 else ""),
             "grid_keys": [
@@ -603,9 +625,8 @@ def write_pdf(
             "letters": letters,
             "full": full,
             "throughput": S["throughput"],
-            "lines": ([S["warmup"]] if S["warmup"] else []) + S["autotune"],
+            "tuning": S["tuning"],
             "server": S["server"],
-            "matrix": S["matrix"],
             "per_target": S["per_target"],
             "targets": targets,
             "notable": notable,

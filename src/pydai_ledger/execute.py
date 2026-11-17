@@ -22,7 +22,7 @@ from ._util import BLOB_PLACEHOLDER, canonical_json, environment, externalize, n
 from .casebook import StoredCase
 from .config import Config, DeterminismError, determinism, missing
 from .journal import Journal
-from .plan import RunPlan, attempt_id
+from .plan import RunPlan, Stage, attempt_id
 from .target import (
     Target,
     current_identity,
@@ -31,6 +31,7 @@ from .target import (
     probe_capabilities,
     reset_prefix_cache,
     scrape_metrics,
+    server_key,
 )
 
 
@@ -148,14 +149,15 @@ class _State:
     shard: tuple[int, int] | None = None
     warmup: int = 0
     capabilities: bool = True
-    autotune: bool = False
-    min_gain: float = 0.05
     seen_parameters: set[str] = field(default_factory=set)
     attempts_seen: dict[str, int] = field(default_factory=dict)
     consecutive_failures: dict[str, int] = field(default_factory=dict)
     aborted: dict[str, str] = field(default_factory=dict)
     warned: set[tuple[str, str]] = field(default_factory=set)
     snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
+    servers: dict[str, str | None] = field(default_factory=dict)  # target -> key of the server it runs on
+    settings: Config = field(default_factory=Config)
+    model_settings: dict[str, Any] = field(default_factory=dict)
 
     def warn(self, target: str, code: str, message: str) -> None:
         """Record a warning once per target and code, and emit it as a Python warning."""
@@ -213,6 +215,8 @@ async def _run_attempt(state: _State, target: Target, concurrency: int, stored: 
     """
     plan, journal = state.plan, state.journal
     recorder = _Recorder(target.model)
+    seed, repeat = plan.attempts[rep]
+    settings: Any = {"seed": seed} if seed is not None else None
 
     def sink(sha: str, data: bytes) -> None:
         if not plan.casebook.has_blob(sha):
@@ -226,6 +230,9 @@ async def _run_attempt(state: _State, target: Target, concurrency: int, stored: 
         "case_index": stored.index,
         "case_id": stored.id,
         "rep": rep,
+        "seed": seed,
+        "repeat": repeat,
+        "server": state.servers.get(target.name),
         "worker_id": journal.worker_id,
         "status": "ok",
         "error": None,
@@ -240,7 +247,9 @@ async def _run_attempt(state: _State, target: Target, concurrency: int, stored: 
             turn_started = now_iso()
             t0 = time.perf_counter()
             async with asyncio.timeout(state.timeout):
-                result = await plan.agent.run(turn.content, message_history=history, model=recorder)
+                result = await plan.agent.run(
+                    turn.content, message_history=history, model=recorder, model_settings=settings
+                )
             duration = time.perf_counter() - t0
             history = result.all_messages()
             requests, recorder.requests = recorder.requests, []
@@ -282,11 +291,12 @@ async def _run_attempt(state: _State, target: Target, concurrency: int, stored: 
     return record
 
 
-async def _run_stage(state: _State, target: Target, concurrency: int) -> tuple[int, int, int]:
-    """Run all pending attempts of one (target, concurrency) stage. Cases are loaded
-    only when a slot is free, so memory stays bounded for very large casebooks.
+async def _run_stage(state: _State, target: Target, stage: Stage) -> tuple[int, int, int]:
+    """Run all pending attempts of one stage of a target. Cases are loaded only when a
+    slot is free, so memory stays bounded for very large casebooks.
     """
     plan, journal, done, progress = state.plan, state.journal, state.done, state.progress
+    concurrency = stage.concurrency
     slots = asyncio.Semaphore(concurrency)
     executed = ok = tokens = 0
 
@@ -304,8 +314,8 @@ async def _run_stage(state: _State, target: Target, concurrency: int) -> tuple[i
             slots.release()
 
     async with asyncio.TaskGroup() as group:
-        for position, raw in enumerate(plan.casebook.records()):
-            if position >= plan.case_count or target.name in state.aborted:
+        for raw in plan.records(stage):
+            if target.name in state.aborted:
                 break
             if state.shard is not None and raw["index"] % state.shard[1] != state.shard[0]:
                 continue
@@ -329,14 +339,19 @@ async def _run_stage(state: _State, target: Target, concurrency: int) -> tuple[i
     return executed, ok, tokens
 
 
+def _forget(state: _State, target: str, concurrency: int) -> None:
+    """Make every attempt of one stage pending again."""
+    state.done.difference_update([done for done in state.done if done.startswith(f"{target}|c{concurrency}|")])
+
+
 async def _warm_up(state: _State, target: Target) -> None:
     """Run the first cases once without recording them as attempts, so model loading
     and other cold-start effects stay out of the measured stages.
     """
     plan, journal = state.plan, state.journal
     started_at, t0, ok, count = now_iso(), time.perf_counter(), 0, 0
-    for position, raw in enumerate(plan.casebook.records()):
-        if position >= min(state.warmup, plan.case_count):
+    for position, raw in enumerate(plan.records(plan.stages(target.name)[0])):
+        if position >= state.warmup:
             break
         record = await _run_attempt(state, target, 0, plan.casebook.load(raw), 0)
         count += 1
@@ -360,7 +375,7 @@ async def _warm_up(state: _State, target: Target) -> None:
 
 
 async def _run_target(state: _State, target: Target) -> None:
-    """Probe one target, then run its warm-up and all its concurrency stages."""
+    """Probe one target, then run its warm-up and its stages (a run has one, a benchmark several)."""
     journal, plan = state.journal, state.plan
     snapshot = state.snapshots.get(target.name) or await probe(target)
     if state.capabilities and target.root_url:  # only real endpoints; three small requests
@@ -370,38 +385,67 @@ async def _run_target(state: _State, target: Target) -> None:
         state.warn(
             target.name, "provider_only", "/server_info not available; only provider-level information recorded."
         )
-    if not state.reset_cache and (len(plan.levels) > 1 or plan.attempts_per_case > 1):
+    stages = plan.stages(target.name)
+    levels = [stage.concurrency for stage in stages]
+    if not state.reset_cache and len(stages) > 1:
         state.warn(
             target.name,
             "prefix_cache_not_reset",
-            "the server's prefix cache is not reset between stages, so later stages and "
-            "repetitions can be faster. Pass reset_prefix_cache=True (needs "
-            "VLLM_SERVER_DEV_MODE=1) if that matters for your comparison.",
+            "the server's prefix cache is not reset between stages, so later stages can be "
+            "faster. Pass reset_prefix_cache=True (needs VLLM_SERVER_DEV_MODE=1).",
         )
     if state.warmup:
         await _warm_up(state, target)
 
-    # Autotune: figures of stages measured so far, including those of an earlier, resumed call.
+    # Benchmark: figures of stages measured so far, including those of an earlier, resumed call.
     measured: dict[int, list[float]] = {}  # concurrency -> [attempts ok, output tokens, wall seconds]
     skipped: set[int] = set()
+    server = state.servers.get(target.name)
     for record in journal.records():
         if record.get("target") != target.name:
             continue
-        if record.get("kind") == "stage":
+        if record.get("server") != server:
+            continue  # measured on a server that is gone
+        if record.get("kind") == "stage" and record.get("attempts_ok"):  # one without success runs again
             entry = measured.setdefault(record["concurrency"], [0, 0, 0.0])
-            entry[0] += record.get("attempts_ok", 0)
+            entry[0] += record["attempts_ok"]
             entry[1] += record.get("output_tokens", 0)
             entry[2] += record["wall_s"]
-        elif record.get("kind") == "autotune":
+        elif record.get("kind") == "tuning":
             skipped = set(record["skipped"])
+
+    # A stage that a server change stopped holds outputs of two servers. It runs again as a
+    # whole; only its new measurement lifts the stop (see Journal.seal).
+    void = {level for name, level, shard in journal.void_stages() if name == target.name and shard == state.shard}
+
+    def in_tokens() -> bool:
+        """One unit for the whole benchmark: tokens only when every level reported them."""
+        return all(entry[1] for entry in measured.values() if entry[0])
 
     def rate(level: int) -> float:
         ok, tokens, wall = measured[level]
-        return (tokens or ok) / wall if wall else 0.0
+        return (tokens if in_tokens() else ok) / wall if wall else 0.0
 
-    for position, concurrency in enumerate(plan.levels):
+    def gains(position: int) -> bool:
+        """Whether the level at ``position`` is faster than every lower one by ``min_gain``."""
+        earlier = [rate(level) for level in levels[:position] if level in measured]
+        return not earlier or rate(levels[position]) >= max(earlier) * (1 + (plan.min_gain or 0.0))
+
+    for position, stage in enumerate(stages):
+        concurrency = stage.concurrency
         if concurrency in skipped:
             continue
+        if plan.min_gain is not None:
+            if concurrency in measured:  # measured by an earlier call; a stage is never topped up
+                if not gains(position):
+                    skipped = set(levels[position + 1 :])
+                    break
+                continue
+            # Attempts without the stage's measurement come from a call that broke off; their
+            # timing is worth nothing, so the whole stage runs again.
+            _forget(state, target.name, concurrency)
+        elif concurrency in void:
+            _forget(state, target.name, concurrency)
         cache_reset = None
         if state.reset_cache:
             cache_reset = await reset_prefix_cache(target)
@@ -411,12 +455,25 @@ async def _run_target(state: _State, target: Target) -> None:
                     "prefix_cache_reset_failed",
                     "reset_prefix_cache=True was requested but /reset_prefix_cache is not available.",
                 )
+                points = determinism(state.model_settings, {target.name: snapshot})  # as it is without a reset
+                if state.settings.on_missing == "error" and "prefix_cache_neutral" in missing(state.settings, points):
+                    raise DeterminismError(
+                        f"Target {target.name!r}: the prefix cache is required to be neutral, but it is on "
+                        "and could not be reset before the stage."
+                    )
         metrics_before = await scrape_metrics(target)
         started_at = now_iso()
         t0 = time.perf_counter()
-        executed, ok, tokens = await _run_stage(state, target, concurrency)
+        executed, ok, tokens = await _run_stage(state, target, stage)
         wall = time.perf_counter() - t0
-        if executed:
+        changed = None
+        if executed and target.root_url and target.name not in state.aborted:
+            before, after = identity(snapshot), await current_identity(target)
+            if before is not None and after is not None and before != after:  # restarted or swapped mid-run
+                changed = state.aborted[target.name] = f"the server changed during the run: {before} became {after}"
+        # No measurement for a stage of two servers, and none for a benchmark stage that stopped:
+        # its figures would stand for a level that was never measured in full.
+        if executed and not changed and not (plan.min_gain is not None and target.name in state.aborted):
             entry = measured.setdefault(concurrency, [0, 0, 0.0])
             entry[0] += ok
             entry[1] += tokens
@@ -426,6 +483,9 @@ async def _run_target(state: _State, target: Target) -> None:
                     "kind": "stage",
                     "target": target.name,
                     "concurrency": concurrency,
+                    "server": server,
+                    "shard": list(state.shard) if state.shard else None,
+                    "stopped": target.name in state.aborted,
                     "worker_id": journal.worker_id,
                     "started_at": started_at,
                     "ended_at": now_iso(),
@@ -438,30 +498,29 @@ async def _run_target(state: _State, target: Target) -> None:
                     "metrics_after": await scrape_metrics(target),
                 }
             )
-        if executed and target.root_url and target.name not in state.aborted:
-            before, after = identity(snapshot), await current_identity(target)
-            if before is not None and after is not None and before != after:  # restarted or swapped mid-run
-                state.aborted[target.name] = f"the server changed during the run: {before} became {after}"
         if target.name in state.aborted:
             reason = state.aborted[target.name]
-            journal.append({"kind": "aborted", "target": target.name, "reason": reason, "at": now_iso()})
+            stop = {"kind": "aborted", "target": target.name, "reason": reason, "at": now_iso()}
+            shard = list(state.shard) if state.shard else None
+            journal.append({**stop, "void_stage": concurrency, "shard": shard} if changed else stop)
             raise RunAbortedError(f"Target {target.name!r} stopped: {reason}")
-        if state.autotune and concurrency in measured:
-            earlier = [rate(level) for level in plan.levels[:position] if level in measured]
-            if earlier and rate(concurrency) < max(earlier) * (1 + state.min_gain):
-                skipped = set(plan.levels[position + 1 :])
-                break
-    if state.autotune and measured:
-        levels = [level for level in plan.levels if level in measured]
+        if plan.min_gain is not None and concurrency in measured and not gains(position):
+            skipped = set(levels[position + 1 :])
+            break
+    levels = [level for level in levels if level in measured and measured[level][0]]  # with a successful attempt
+    if plan.min_gain is not None and levels:
         journal.append(
             {
-                "kind": "autotune",
+                "kind": "tuning",
                 "target": target.name,
+                "server": server,
                 "at": now_iso(),
-                "metric": "output_tokens_per_s" if any(measured[level][1] for level in levels) else "attempts_per_s",
-                "min_gain": state.min_gain,
-                "levels": [{"concurrency": level, "rate": rate(level)} for level in levels],
-                "best": next(level for level in levels if rate(level) >= max(map(rate, levels)) * (1 - state.min_gain)),
+                "metric": "output_tokens_per_s" if in_tokens() else "attempts_per_s",
+                "min_gain": plan.min_gain,
+                "levels": [
+                    {"concurrency": level, "rate": rate(level), "cases": int(measured[level][0])} for level in levels
+                ],
+                "best": next(level for level in levels if rate(level) >= max(map(rate, levels)) * (1 - plan.min_gain)),
                 "skipped": sorted(skipped),
             }
         )
@@ -478,15 +537,13 @@ async def execute(
     shard: tuple[int, int] | None = None,
     warmup: int = 0,
     probe_capabilities: bool = True,
-    autotune: bool = False,
-    min_gain: float = 0.05,
     config: str | os.PathLike[str] | Config | None = None,
 ) -> None:
     """Run every planned attempt that is not yet successful in ``journal``.
 
-    Targets run in parallel (they are independent servers). Per target the concurrency
-    levels run one after another so their throughput figures do not disturb each other.
-    Calling this again on the same journal resumes: successful attempts are skipped,
+    Targets run side by side, each with its own concurrency, because they are
+    independent servers; ``RunPlan(sequential_targets=True)`` runs them one after
+    another. Every attempt records the seed it was sent with. Calling this again on the same journal resumes: successful attempts are skipped,
     failed and missing ones are executed.
 
     ``timeout``
@@ -496,20 +553,14 @@ async def execute(
         row, or at once when its very first request cannot reach the server. ``None``
         disables the threshold.
     ``reset_prefix_cache``
-        Call vLLM's ``/reset_prefix_cache`` before every stage (needs dev mode). Off by
-        default; a warning is recorded when stages or repetitions could be affected.
+        Call vLLM's ``/reset_prefix_cache`` before the target starts (needs dev mode).
+        Off by default.
     ``warmup``
-        Number of cases to run once per target before the first stage. Their results
-        are discarded (only a ``warmup`` event is recorded), which keeps model loading
-        out of the measurements. Off (0) by default.
+        Number of cases to run once per target before its attempts. Their results are
+        discarded (only a ``warmup`` event is recorded). Off (0) by default.
     ``probe_capabilities``
         Send three small requests to every HTTP target before the run to record whether
         it supports tool output, native JSON-schema output and image input. On by default.
-    ``autotune``
-        Treat ``plan.concurrency`` as a ladder: run the levels in order and stop a target
-        as soon as a level is not at least ``min_gain`` (5 %) faster than the best level
-        before it. The remaining levels are skipped and do not count as missing. See
-        :func:`pydai_ledger.autotune` for the ready-made search.
     ``config``
         A :class:`Config` or the path of a ``pydai-ledger.toml``; by default the file in
         the working directory is used when it exists. Determinism points it requires are
@@ -522,8 +573,8 @@ async def execute(
     """
     if shard is not None and not 0 <= shard[0] < shard[1]:
         raise ValueError(f"shard must be (i, n) with 0 <= i < n, got {shard!r}.")
-    if autotune and shard is not None:
-        raise ValueError("autotune measures whole stages and cannot be combined with shard.")
+    if plan.min_gain is not None and shard is not None:
+        raise ValueError("a benchmark measures whole stages and cannot be combined with shard.")
     done = journal.done()
     planned = set(plan.attempt_ids(shard))
     tracker = _Progress(len(planned), len(done & planned), progress)
@@ -540,8 +591,6 @@ async def execute(
                 "shard": list(shard) if shard else None,
                 "warmup": warmup,
                 "probe_capabilities": probe_capabilities,
-                "autotune": autotune,
-                "min_gain": min_gain,
             },
         }
     )
@@ -556,16 +605,22 @@ async def execute(
         shard=shard,
         warmup=warmup,
         capabilities=probe_capabilities,
-        autotune=autotune,
-        min_gain=min_gain,
     )
     settings = Config.load(config)
     journal.append({"kind": "config", "at": now_iso(), "worker_id": journal.worker_id, **settings.describe()})
     probed = await asyncio.gather(*(probe(target) for target in plan.targets))
     state.snapshots = {target.name: snapshot for target, snapshot in zip(plan.targets, probed, strict=True)}
+    state.servers = {name: server_key(snapshot) for name, snapshot in state.snapshots.items()}
+    # Attempts of a server that has changed since do not count: they run again on the one that is there now.
+    stale = done - journal.done(state.servers)
+    done -= stale
+    tracker.done -= len(stale & planned)
+    recorded = to_jsonable_python(plan.agent.model_settings, fallback=repr)
+    model_settings = dict(recorded) if isinstance(recorded, dict) else {}
+    if plan.seeds:  # the plan's seeds replace the agent's
+        model_settings["seed"] = ", ".join(map(str, plan.seeds))
+    state.settings, state.model_settings = settings, model_settings
     if settings.require and settings.on_missing == "error":
-        recorded = to_jsonable_python(plan.agent.model_settings, fallback=repr)
-        model_settings = recorded if isinstance(recorded, dict) else {}
         points = determinism(model_settings, state.snapshots, reset_prefix_cache=reset_prefix_cache)
         gaps = missing(settings, points)
         if gaps:
@@ -577,7 +632,16 @@ async def execute(
                 f"Required determinism points do not hold: {detail}. "
                 f"Fix the setup or change [determinism] in {settings.source}."
             )
-    results = await asyncio.gather(*(_run_target(state, target) for target in plan.targets), return_exceptions=True)
+    results: list[BaseException | None]
+    if plan.sequential_targets:
+        results = []
+        for target in plan.targets:
+            try:
+                results.append(await _run_target(state, target))
+            except Exception as exc:  # the other targets still get their turn
+                results.append(exc)
+    else:
+        results = await asyncio.gather(*(_run_target(state, target) for target in plan.targets), return_exceptions=True)
     tracker.report()
     errors = [r for r in results if isinstance(r, BaseException)]
     if len(errors) == 1:

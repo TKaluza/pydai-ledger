@@ -45,7 +45,7 @@ def test_pack_and_open_bundle(tmp_path):
     book = Casebook.write(tmp_path / "book.zip", make_cases())
     ledgers = []
     for reps in (1, 2):  # two different plans = two runs
-        plan = RunPlan(book, Agent(output_type=Answer), [Target("t", TestModel())], attempts_per_case=reps)
+        plan = RunPlan(book, Agent(output_type=Answer), [Target("t", TestModel())], repeats=reps)
         with Journal.open(plan, parent=tmp_path / "staging") as journal:
             run(execute(plan, journal, progress=False))
             ledgers.append(journal.seal(tmp_path / f"run{reps}.zip"))

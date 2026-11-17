@@ -1,7 +1,7 @@
 """Self-contained HTML report of one ledger.
 
-One file without external resources: charts are inline SVG, fonts are embedded, colours
-follow the browser's light or dark setting. The cases are embedded as gzip-compressed
+One file without external resources: charts are inline SVG, fonts are embedded, the page
+opens light and has a switch to dark. The cases are embedded as gzip-compressed
 JSON and shown by a little JavaScript as a compact table with filter, search, sorting
 and paging; large case sets are only unpacked when the reader asks for them. All
 figures come from :mod:`pydai_ledger.summary`, shared with the PDF report.
@@ -14,44 +14,50 @@ import base64
 import gzip
 import json
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from html import escape
 from pathlib import Path
 from typing import Any
 
 from .casebook import Casebook
 from .config import Config
+from .header import ReportHeader
 from .ledger import Ledger
-from .summary import GRID_COLOURS, MAX_SERIES, _panel, _result_grid, build
+from .summary import GRID_COLOURS, MAX_SERIES, _curve, _result_grid, build
 
 AUTOLOAD_BYTES = 1_500_000  # larger case payloads are unpacked on request
 FONTS = Path(__file__).parent / "fonts"
 
 _CSS = """
-:root{color-scheme:light;--page:#f5f4f0;--surface:#fcfcfb;--text:#0b0b0b;--text2:#52514e;--muted:#898781;
+:root{color-scheme:light;--page:#f5f4f0;--surface:#fcfcfb;--text:#0b0b0b;--text2:#0b0b0b;--muted:#0b0b0b;
 --grid:#e1e0d9;--border:rgba(11,11,11,.10);--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;--s5:#e87ba4;
 --s6:#008300;--s7:#6250d6;--s8:#e34948;--good:#0ca30c;--warning:#fab219;--critical:#d03b3b;
 --warn-bg:#fff4d1;--crit-bg:#fde3e1;--code:#f0efec}
-@media (prefers-color-scheme:dark){:root{color-scheme:dark;--page:#121211;--surface:#1a1a19;--text:#f0efec;
---text2:#c3c2b7;--grid:#2c2c2a;--border:rgba(255,255,255,.10);--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;
---s5:#d55181;--s6:#008300;--s7:#9085e9;--s8:#e66767;--warn-bg:#3a3010;--crit-bg:#3d1a19;--code:#262624}}
+:root[data-theme=dark]{color-scheme:dark;--page:#121211;--surface:#1a1a19;--text:#f0efec;
+--text2:#f0efec;--muted:#f0efec;--grid:#2c2c2a;--border:rgba(255,255,255,.10);--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;
+--s5:#d55181;--s6:#008300;--s7:#9085e9;--s8:#e66767;--warn-bg:#3a3010;--crit-bg:#3d1a19;--code:#262624}
 *{box-sizing:border-box}body{margin:0;background:var(--page);color:var(--text);
-font:14px/1.5 Jost,system-ui,-apple-system,"Segoe UI",sans-serif}
+font:14px/1.5 Lato,system-ui,-apple-system,"Segoe UI",sans-serif}
 main{max-width:1180px;margin:0 auto;padding:24px 16px 64px}
-h1{font-size:22px;margin:0;font-weight:600}h2{font-size:18px;font-weight:600;margin:44px 0 10px}h3{font-size:14px;margin:0 0 8px}
+h1{font-size:22px;margin:0;font-weight:700}h2{font-size:18px;font-weight:700;margin:44px 0 10px}h3{font-size:14px;margin:0 0 8px}h3.sec{font-size:15px;margin:28px 0 6px}
+.theme{display:block;margin:-10px 0 8px auto;font:inherit;font-size:12px;color:var(--text);background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:3px 9px;cursor:pointer}
+@media print{.theme{display:none}}
 header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:18px}
 .qr{flex:none;text-align:right}.qr svg{width:92px;height:92px;display:block;margin-left:auto;background:#fff}.qr small{color:var(--muted);font-size:10px}
 .meta{color:var(--text2);margin:6px 0;font-size:13px}header .meta{margin:0}
 .facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin:0}
 .facts div{padding:10px 14px 10px 0}.facts dt{font-size:12px;color:var(--text2)}
-.facts dd{margin:2px 0 0;font-size:24px;font-weight:600;line-height:1.2;font-variant-numeric:tabular-nums}.facts small{color:var(--muted);font-size:12px}
+.facts dd{margin:2px 0 0;font-size:24px;font-weight:700;line-height:1.2;font-variant-numeric:tabular-nums}.facts small{color:var(--muted);font-size:12px}
 .notes{list-style:none;margin:14px 0 0;padding:0;font-size:13px;display:grid;grid-template-columns:max-content 1fr;gap:6px 14px}
-.notes li{display:contents}.notes b{border-left:4px solid var(--warning);padding-left:8px;font-weight:600}
+.notes li{display:contents}.notes b{border-left:4px solid var(--warning);padding-left:8px;font-weight:700}
 .notes li.error b{border-left-color:var(--critical)}.notes li.info b{border-left-color:var(--muted)}
 .notes details{margin-top:2px;color:var(--text2)}.notes summary{cursor:pointer;color:var(--muted);font-size:12px}.notes details p{margin:4px 0 6px;max-width:70ch}
-.mx{width:auto}.mx th{border:0;font-weight:400;color:var(--text2)}.mx td{font-family:"Ubuntu Mono",ui-monospace,Consolas,monospace;text-align:right}
+.mx{width:auto}.mx th{border:0;font-weight:700}.mx td{font-family:"Ubuntu Mono",ui-monospace,Consolas,monospace;text-align:right}
 rect[data-c]{cursor:pointer}
-.cap{color:var(--muted);font-size:12px;margin:14px 0 2px}
+.cap{font-size:12px;margin:22px 0 4px}.remark{font-style:italic;font-size:13px;margin:6px 0}
+.split{display:grid;grid-template-columns:max-content 1fr;gap:10px 32px;align-items:start;margin-top:10px}
+.split .cap{margin-top:0}.split p:not(.cap){margin:0 0 8px;font-size:13px;color:var(--text2);max-width:62ch}
+@media(max-width:760px){.split{grid-template-columns:1fr}}
 .det{list-style:none;margin:8px 0 0;padding:0;font-size:13px;display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:4px 28px}
 .det li{display:grid;grid-template-columns:76px 1fr;gap:8px}.det b{font-weight:400;font-family:"Ubuntu Mono",ui-monospace,Consolas,monospace;color:var(--muted)}
 .det li.on b{color:var(--good)}.det li.off b{color:var(--critical)}.det li.mixed b{color:#a86b00}.det em{color:var(--muted);font-style:normal}.det code{color:var(--text2);font-size:12px}
@@ -59,8 +65,8 @@ td.c,th.c{text-align:center}
 .sub{color:var(--text2);margin:0 0 20px}.muted{color:var(--muted)}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:14px}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
-.tile .v{font-size:26px;font-weight:600;line-height:1.2}.tile .l{color:var(--text2);font-size:12px}
-.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}
+.tile .v{font-size:26px;font-weight:700;line-height:1.2}.tile .l{color:var(--text2);font-size:12px}
+.curve svg{width:100%;max-width:680px}
 figure{margin:0 0 14px}figcaption{color:var(--text2);font-size:13px;margin-top:6px;max-width:75ch}figure svg{max-width:100%}
 figure .scroll svg{min-width:640px}
 .note{border-radius:10px;padding:10px 14px;margin:8px 0;border:1px solid var(--border);display:flex;gap:10px}
@@ -68,7 +74,7 @@ figure .scroll svg{min-width:640px}
 .note.crit{background:var(--crit-bg);border-left:5px solid var(--critical)}
 .note b{white-space:nowrap}
 table{border-collapse:collapse;width:100%;font-size:13px}th,td{text-align:left;padding:5px 10px;
-vertical-align:top}th{font-weight:600;border-bottom:1px solid var(--text2)}tr:hover td{background:var(--code)}
+vertical-align:top}th{font-weight:700;border-bottom:1px solid var(--text2)}tr:hover td{background:var(--code)}
 td.n,th.n{text-align:right}td.n,.facts dd{font-family:"Ubuntu Mono",ui-monospace,Consolas,monospace}
 .scroll{overflow-x:auto}
 code,pre{font:12.5px/1.45 "Ubuntu Mono",ui-monospace,Consolas,monospace;background:var(--code);border-radius:5px}
@@ -81,7 +87,7 @@ details{margin:6px 0}summary{cursor:pointer;padding:4px 0}
 .tag{display:inline-block;border-radius:5px;padding:0 6px;font-size:12px;border:1px solid var(--border);margin-right:4px}
 .tag.bad{background:var(--crit-bg)}.tag.warn{background:var(--warn-bg)}
 .thumbs img{max-width:160px;max-height:160px;border-radius:6px;border:1px solid var(--border);margin:4px 6px 4px 0}
-svg text{font:11px Jost,system-ui,sans-serif;fill:var(--muted)}svg .lab{fill:var(--text2)}
+svg text{font:11px Lato,system-ui,sans-serif;fill:var(--muted)}svg .lab{fill:var(--text2)}
 .bar{display:flex;flex-wrap:wrap;gap:6px 8px;align-items:center;margin-bottom:10px}
 .bar button,.bar input,.bar select,.load{font:inherit;font-size:12px;color:var(--text);background:var(--surface);
 border:1px solid var(--border);border-radius:6px;padding:3px 9px}
@@ -104,6 +110,12 @@ font-size:12px;display:none;z-index:9;white-space:pre}
 """
 
 _JS = r"""
+// The page starts light whatever the system says; the switch is the only way to dark. Print is always light.
+const themeBtn=document.querySelector('.theme'),rootEl=document.documentElement;
+if(themeBtn){const names=JSON.parse(themeBtn.dataset.labels);let dark=false;
+ const set=on=>{if(on)rootEl.dataset.theme='dark';else delete rootEl.dataset.theme};
+ themeBtn.onclick=()=>{dark=!dark;set(dark);themeBtn.textContent=names[dark?1:0]};
+ addEventListener('beforeprint',()=>set(false));addEventListener('afterprint',()=>set(dark))}
 const tip=document.getElementById('tip');
 const gridEl=document.getElementById('grid'),G=gridEl?JSON.parse(gridEl.dataset.grid):null;
 function cellTip(el){const c=+el.dataset.c,k=window.pydaiKeys&&window.pydaiKeys.get(c);
@@ -187,15 +199,20 @@ const btn=root.querySelector('.load');if(btn)btn.onclick=load;else load();
 
 
 def _font_css() -> str:
-    """The bundled fonts as @font-face rules (Jost for text, Ubuntu Mono for code and numbers)."""
+    """The bundled fonts as @font-face rules (Lato for text, Ubuntu Mono for code and numbers)."""
     rules = ""
-    for family, weight, name in (
-        ("Jost", 400, "Jost-Regular"),
-        ("Jost", 600, "Jost-SemiBold"),
-        ("Ubuntu Mono", 400, "UbuntuMono-Regular"),
+    for family, weight, style, name in (
+        ("Lato", 400, "normal", "Lato-Regular"),
+        ("Lato", 400, "italic", "Lato-Italic"),
+        ("Lato", 700, "normal", "Lato-Bold"),
+        ("Ubuntu Mono", 400, "normal", "UbuntuMono-Regular"),
+        ("Ubuntu Mono", 400, "italic", "UbuntuMono-Italic"),
     ):
         data = base64.b64encode((FONTS / f"{name}.ttf").read_bytes()).decode("ascii")
-        rules += f'@font-face{{font-family:"{family}";font-weight:{weight};src:url(data:font/ttf;base64,{data}) format("truetype")}}'
+        rules += (
+            f'@font-face{{font-family:"{family}";font-weight:{weight};font-style:{style};'
+            f'src:url(data:font/ttf;base64,{data}) format("truetype")}}'
+        )
     return rules
 
 
@@ -208,33 +225,62 @@ def qr_svg(text: str) -> str | None:
     return segno.make(text, error="m").svg_inline(border=2, dark="#111111", light="#ffffff", omitsize=True)
 
 
-def _table(t: dict[str, Any], row_head: bool = False) -> str:
+def _table(t: dict[str, Any]) -> str:
     """Render a summary table as HTML."""
     cls = {"l": "", "r": ' class="n"', "c": ' class="c"'}
     head = "".join(f"<th{cls[a]}>{escape(h)}</th>" for h, a in zip(t["head"], t["align"], strict=True))
     rows = "".join(
-        "<tr>"
-        + "".join(
-            f"<th>{escape(c)}</th>" if row_head and i == 0 else f"<td{cls[a]}>{escape(c)}</td>"
-            for i, (c, a) in enumerate(zip(row, t["align"], strict=True))
-        )
-        + "</tr>"
+        "<tr>" + "".join(f"<td{cls[a]}>{escape(c)}</td>" for c, a in zip(row, t["align"], strict=True)) + "</tr>"
         for row in t["rows"]
     )
     return f'<div class="scroll"><table><tr>{head}</tr>{rows}</table></div>'
 
 
-def _matrix(S: dict[str, Any]) -> str:
-    """The agreement matrix as a compact table; a cell darkens as agreement falls below 100 %."""
-    head = "".join(f"<th>{escape(t)}</th>" for t in S["targets"])
+def _matrix(block: dict[str, Any]) -> str:
+    """Reproducibility between targets with one model as a compact table. A target against
+    itself and pairs of different models stay empty; a cell turns yellow as the share of
+    identical outputs falls below 100 %.
+    """
+    head = "".join(f"<th>{escape(t)}</th>" for t in block["targets"])
     rows = ""
-    for row, values in zip(S["matrix"]["rows"], S["matrix_values"], strict=True):
-        cells = "".join(
-            f'<td style="background:rgba(250,178,25,{0 if v is None else min(1.0, (1 - v) * 4):.2f})">{escape(c)}</td>'
-            for c, v in zip(row[1:], values, strict=True)
-        )
-        rows += f"<tr><th>{escape(row[0])}</th>{cells}</tr>"
+    for name, texts, values in zip(block["targets"], block["rows"], block["values"], strict=True):
+        cells = ""
+        for text, value in zip(texts, values, strict=True):
+            style = (
+                f"background:rgba(250,178,25,{min(1.0, (1 - value) * 4):.2f})"
+                if value is not None and value < 1
+                else ""
+            )
+            cells += f'<td style="{style}">{escape(text)}</td>'
+        rows += f"<tr><th>{escape(name)}</th>{cells}</tr>"
     return f'<div class="scroll"><table class="mx"><tr><th></th>{head}</tr>{rows}</table></div>'
+
+
+def _validation(S: dict[str, Any]) -> str:
+    """The validation section: setup, precision, trueness and accuracy, block by block."""
+    L, out = S["L"], ""
+    for block in S["validation"]:
+        kind = block["kind"]
+        if kind == "h2":
+            out += f'<h3 class="sec">{escape(block["text"])}</h3>'
+        elif kind == "text":
+            out += f'<p class="meta">{escape(block["text"])}</p>'
+        elif kind == "det":
+            out += (
+                '<ul class="det">'
+                + "".join(
+                    f'<li class="{i["state"]}"><b>{escape(i["word"])}</b><span>{escape(i["label"])}'
+                    + (f" <em>({escape(L['d_required'])})</em>" if i["required"] else "")
+                    + (f" <code>{escape(i['value'])}</code>" if i["value"] else "")
+                    + "</span></li>"
+                    for i in block["items"]
+                )
+                + "</ul>"
+            )
+        else:
+            cap = f'<p class="cap">{escape(block["cap"])}</p>' if block["cap"] else ""
+            out += cap + (_matrix(block) if kind == "matrix" else _table(block["table"]))
+    return out
 
 
 def _json_block(obj: Any) -> str:
@@ -270,24 +316,28 @@ def write_report(
     max_cases: int | None = None,
     max_images: int = 30,
     thumbnail_px: int = 256,
-    title: str | None = None,
-    author: str | None = None,
-    number: str | None = None,
-    date: str | None = None,
+    header: ReportHeader | None = None,
+    sections: Sequence[str] | None = None,
     embed_fonts: bool = True,
     normalize: Callable[[Any], Any] | None = None,
     config: str | os.PathLike[str] | Config | None = None,
 ) -> Path:
     """Write the HTML report of ``ledger`` to ``path``.
 
-    ``title``, ``author``, ``number`` (your own report or run number) and ``date`` head
-    the report; the date defaults to the time the ledger was sealed.
+    What the report is follows from what it is given. A run ledger gives the run
+    report: precision, trueness and accuracy per target, the attempts with their seeds, the cases.
+    A benchmark ledger gives the benchmark report: recommended concurrency, throughput
+    and latency per level. Each ledger gets its own report. ``sections`` limits a
+    report to some of ``"targets"``, ``"benchmark"``,
+    ``"validation"`` and ``"cases"``.
+
+    ``header`` is a :class:`ReportHeader` with title, authors, number and date.
     ``lang`` is ``"en"`` or ``"de"``. With ``casebook`` the report also shows keys,
     prompts, image previews and the match with expected outputs. All cases go into the
     case table unless ``max_cases`` limits it (failed cases first, then differing
     outputs, then outputs that are not as expected). Only the first ``max_images``
     images in that order get a preview of ``thumbnail_px`` pixels; the others are listed
-    by type and hash. ``embed_fonts=False`` leaves the bundled fonts out (about 250 KB)
+    by type and hash. ``embed_fonts=False`` leaves the bundled fonts out (about 600 KB)
     and falls back to fonts installed on the reader's machine. ``normalize`` is applied to
     outputs before they are compared, see :meth:`Ledger.agreement`. ``config`` is a
     :class:`Config` or the path of a ``pydai-ledger.toml`` that sets the level of each
@@ -297,23 +347,22 @@ def write_report(
         ledger,
         casebook,
         lang=lang,
-        title=title,
-        author=author,
-        number=number,
-        date=date,
+        header=header,
+        sections=sections,
         max_cases=max_cases,
         max_images=max_images,
         thumbnail_px=thumbnail_px,
         normalize=normalize,
         config=config,
     )
-    L = S["L"]
+    L, show = S["L"], S["show"]
     h: list[str] = []
     add = h.append
 
     qr = qr_svg(S["stamp"])
+    head = "<br>".join(escape(line) for line in S["head"])
     add(
-        f'<header><div><h1>{escape(S["title"])}</h1><p class="meta">{escape(S["meta"])}</p></div>'
+        f'<header><div><h1>{escape(S["title"])}</h1><p class="meta">{head}</p></div>'
         + (
             f'<div class="qr" data-tip="{escape(S["stamp"], quote=True)}">{qr}<small>{escape(L["stamp"])}</small></div>'
             if qr
@@ -332,89 +381,82 @@ def write_report(
     if S["config_line"]:
         add(f'<p class="meta">{escape(S["config_line"])}</p>')
 
-    add(f'<h2>{escape(L["models"])}</h2><p class="cap">{escape(L["hardware_title"])}</p>{_table(S["models"])}')
-    add(f'<p class="cap">{escape(L["setup_title"])}</p>{_table(S["capabilities"])}')
+    if show["targets"]:
+        add(f'<h2>{escape(L["models"])}</h2><p class="cap">{escape(L["hardware_title"])}</p>{_table(S["models"])}')
+        add(f'<p class="cap">{escape(L["setup_title"])}</p>{_table(S["capabilities"])}')
 
-    add(f"<h2>{escape(L['throughput'])}</h2>")
-    add(_notes(S, "throughput"))
     figure = 0
-    if S["charts"]:
-        figure += 1
-        legend = "".join(
-            f'<span><i class="sw" style="background:var(--s{i + 1})"></i>{escape(name)}</span>'
-            for i, name in enumerate(S["targets"][:MAX_SERIES])
-        )
-        panels = "".join(
-            f"<div>{_panel(c['label'], c['y_label'], L['axis_concurrency'], S['levels'], c['series'])}</div>"
-            for c in S["charts"]
-        )
-        add(
-            f'<figure><div class="legend">{legend}</div><div class="charts">{panels}</div>'
-            f"<figcaption><b>{escape(L['figure'])} {figure}.</b> {escape(S['chart_caption'])}</figcaption></figure>"
-        )
-    if S["charts_note"]:
-        add(f'<p class="muted">{escape(S["charts_note"])}</p>')
-    add(_table(S["throughput"]))
-    for line in ([S["warmup"]] if S["warmup"] else []) + S["autotune"]:
-        add(f'<p class="meta">{escape(line)}</p>')
-    if S["server"]:
-        add(f'<h3 style="margin-top:18px">{escape(L["server_means"])}</h3>{_table(S["server"])}')
-
-    add(f'<h2>{escape(L["agreement"])}</h2><p class="meta">{escape(L["agreement_note"])}</p>{_matrix(S)}')
-    add(f'<div style="margin-top:14px">{_table(S["per_target"])}</div>')
-    if not S["has_casebook"]:
-        add(f'<p class="muted">{escape(L["no_casebook"])}</p>')
-
-    grid, per_cell = _result_grid(S["states"], L["axis_case"])
-    figure += 1
-    legend = "".join(
-        f'<span><i class="sw" style="background:{GRID_COLOURS[state]}"></i>{escape(L[key])}</span>'
-        for state, key in ((1, "grid_ok"), (2, "grid_dev"), (3, "grid_fail"), (0, "grid_none"))
-    )
-    caption = L["fig_grid"].format(agg=L["grid_agg"].format(k=per_cell) if per_cell > 1 else "")
-    if len(S["targets"]) > 1:
-        caption += L["grid_rows"].format(names=", ".join(S["targets"]))
-    grid_info = {
-        "targets": S["targets"],
-        "states": [L["grid_none"], L["grid_ok"], L["grid_dev"], L["grid_fail"]],
-        "case": L["case"],
-        "cases": L["cases_per_cell"],
-        "per": per_cell,
-        "hint": L["grid_click"],
-    }
-    add(
-        f'<h2>{escape(L["results"])}</h2><figure id="grid" data-grid="{escape(json.dumps(grid_info, ensure_ascii=False), quote=True)}">'
-        f'<div class="legend">{legend}</div><div class="scroll">{grid}</div>'
-        f"<figcaption><b>{escape(L['figure'])} {figure}.</b> {escape(caption)}</figcaption></figure>"
-    )
+    if show["benchmark"]:
+        add(f"<h2>{escape(L['throughput'])}</h2>")
+        add(_notes(S, "throughput"))
+        if S["curve"]:
+            figure += 1
+            legend = "".join(
+                f'<span><i class="sw" style="background:var(--s{i + 1})"></i>{escape(name)}</span>'
+                for i, name in enumerate(S["series_names"][:MAX_SERIES])
+            )
+            add(
+                f'<figure><div class="legend">{legend}</div><div class="curve">{_curve(**S["curve"])}</div>'
+                f"<figcaption><b>{escape(L['figure'])} {figure}.</b> {escape(S['chart_caption'])}</figcaption></figure>"
+            )
+        if S["charts_note"]:
+            add(f'<p class="remark">{escape(S["charts_note"])}</p>')
+        add(_table(S["throughput"]))
+        if S["tuning"]:
+            add(f'<p class="cap">{escape(L["result_title"])}</p>{_table(S["tuning"])}')
+        if S["server"]:
+            add(f'<h3 style="margin-top:18px">{escape(L["server_means"])}</h3>{_table(S["server"])}')
 
     payload = S["cases"]
     packed = base64.b64encode(
         gzip.compress(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(), mtime=0)
     ).decode("ascii")
-    add(
-        f'<h2>{escape(L["determinism"])}</h2><p class="meta">{escape(S["determinism"]["summary"])}</p><ul class="det">'
-        + "".join(
-            f'<li class="{i["state"]}"><b>{escape(i["word"])}</b><span>{escape(i["label"])}'
-            + (f" <em>({escape(L['d_required'])})</em>" if i["required"] else "")
-            + (f" <code>{escape(i['value'])}</code>" if i["value"] else "")
-            + "</span></li>"
-            for i in S["determinism"]["items"]
-        )
-        + "</ul>"
-    )
+    if show["validation"]:
+        add(f"<h2>{escape(L['validation'])}</h2>{_validation(S)}")
+        if S["model_pairs"]:
+            add(
+                f"<h2>{escape(L['model_comparison'])}</h2>"
+                f'<p class="meta">{escape(L["model_comparison_note"])}</p>{_table(S["model_pairs"])}'
+            )
+        add(f"<h2>{escape(L['execution_title'])}</h2>{_table(S['per_target'])}")
+        if S["execution"]:
+            add(f'<p class="remark">{escape(S["execution"])}</p>')
 
-    add(f'<h2>{escape(L["cases"])}</h2><p class="meta">{escape(S["cases_note"])}. {escape(L["cases_hint"])}</p>')
-    button = ""
-    if len(packed) > AUTOLOAD_BYTES:
-        text = L["js_load"].format(n=f"{len(payload['cases']):,}", mb=f"{len(packed) / 1e6:.1f}")
-        button = f'<button class="load">{escape(text)}</button>'
-    labels = {k: v for k, v in L.items() if k.startswith("js_") or k in ("turn", "expected")}
-    labels["locale"] = "de-DE" if S["lang"] == "de" else "en-US"
-    add(
-        f'<div id="cases" data-targets="{escape(json.dumps(S["targets"]), quote=True)}" '
-        f'data-labels="{escape(json.dumps(labels, ensure_ascii=False), quote=True)}">{button}</div>'
-    )
+        grid, per_cell = _result_grid(S["states"], L["axis_case"], ids=S["case_ids"])
+        figure += 1
+        legend = "".join(
+            f'<span><i class="sw" style="background:{GRID_COLOURS[state]}"></i>{escape(L[key])}</span>'
+            for state, key in ((1, "grid_ok"), (2, "grid_dev"), (3, "grid_fail"), (0, "grid_none"))
+        )
+        caption = L["fig_grid"].format(agg=L["grid_agg"].format(k=per_cell) if per_cell > 1 else "")
+        if len(S["targets"]) > 1:
+            caption += L["grid_rows"].format(names=", ".join(S["targets"]))
+        grid_info = {
+            "targets": S["targets"],
+            "states": [L["grid_none"], L["grid_ok"], L["grid_dev"], L["grid_fail"]],
+            "case": L["case"],
+            "cases": L["cases_per_cell"],
+            "per": per_cell,
+            "hint": L["grid_click"],
+        }
+        add(
+            f'<h2>{escape(L["results"])}</h2><figure id="grid" data-grid="{escape(json.dumps(grid_info, ensure_ascii=False), quote=True)}">'
+            f'<div class="legend">{legend}</div><div class="scroll">{grid}</div>'
+            f"<figcaption><b>{escape(L['figure'])} {figure}.</b> {escape(caption)}</figcaption></figure>"
+        )
+
+    if show["cases"]:
+        add(f'<h2>{escape(L["cases"])}</h2><p class="meta">{escape(S["cases_note"])}. {escape(L["cases_hint"])}</p>')
+        button = ""
+        if len(packed) > AUTOLOAD_BYTES:
+            text = L["js_load"].format(n=f"{len(payload['cases']):,}", mb=f"{len(packed) / 1e6:.1f}")
+            button = f'<button class="load">{escape(text)}</button>'
+        labels = {k: v for k, v in L.items() if k.startswith("js_") or k in ("turn", "expected")}
+        labels["locale"] = "de-DE" if S["lang"] == "de" else "en-US"
+        add(
+            f'<div id="cases" data-targets="{escape(json.dumps(S["targets"]), quote=True)}" '
+            f'data-labels="{escape(json.dumps(labels, ensure_ascii=False), quote=True)}">{button}</div>'
+        )
 
     add(f"<h2>{escape(L['run_details'])}</h2>")
     if S["runs"]:
@@ -454,7 +496,9 @@ def write_report(
     html = (
         f'<!doctype html><html lang="{S["lang"]}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
         f"<title>{escape(S['title'])} {S['run_id'][:12]}</title><style>{_font_css() if embed_fonts else ''}{_CSS}</style></head>"
-        f'<body><main>{"".join(h)}</main><div id="tip"></div>'
+        f'<body><main><button class="theme" type="button" '
+        f'data-labels="{escape(json.dumps([L["theme_dark"], L["theme_light"]]), quote=True)}">'
+        f'{escape(L["theme_dark"])}</button>{"".join(h)}</main><div id="tip"></div>'
         f'<script id="cases-data" type="application/octet-stream">{packed}</script><script>{_JS}</script></body></html>'
     )
     path = Path(path)

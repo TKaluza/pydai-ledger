@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import re
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -123,12 +124,14 @@ def determinism(
     model_settings: dict[str, Any] | None,
     snapshots: dict[str, dict[str, Any]],
     *,
-    reset_prefix_cache: bool = False,
+    reset_prefix_cache: bool | Mapping[str, bool] = False,
 ) -> dict[str, dict[str, tuple[str, str]]]:
     """Per target, the state and observed value of every determinism point.
 
     Server points need ``/server_info`` (vLLM dev mode); without it they are "unknown".
     The point that compares targets is "n/a" when there is only one target.
+    ``reset_prefix_cache`` says whether the cache was emptied before every stage, for all
+    targets or per target; pass what was recorded, not what was asked for.
     """
     settings = model_settings or {}
     temperature, seed = settings.get("temperature"), settings.get("seed")
@@ -142,7 +145,8 @@ def determinism(
         caching = _setting(config, "enable_prefix_caching")
         tensor = _setting(config, "tensor_parallel_size")
         invariant, multi = env.get("VLLM_BATCH_INVARIANT"), env.get("VLLM_ENABLE_V1_MULTIPROCESSING")
-        neutral = None if not known or caching is None else caching == "False" or reset_prefix_cache
+        reset = reset_prefix_cache.get(name, False) if isinstance(reset_prefix_cache, Mapping) else reset_prefix_cache
+        neutral = None if not known or caching is None else caching == "False" or reset
         out[name] = {
             "temperature_zero": (_flag(temperature == 0), "–" if temperature is None else str(temperature)),
             "request_seed": (_flag(seed is not None), "–" if seed is None else str(seed)),
@@ -153,7 +157,7 @@ def determinism(
             "batch_invariant": (_flag(None if invariant is None else bool(invariant)), str(invariant or "–")),
             "prefix_cache_neutral": (
                 _flag(neutral),
-                "–" if caching is None else f"caching {caching}, reset {reset_prefix_cache}",
+                "–" if caching is None else f"caching {caching}, reset {reset}",
             ),
             "single_gpu": (_flag(None if tensor is None else tensor == "1"), tensor or "–"),
             "multiprocessing_off": (_flag(None if multi is None else not multi), str(multi if known else "–")),
